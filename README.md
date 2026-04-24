@@ -7,7 +7,8 @@ files.
 This tool is meant to more easily create diffs between versions of more
 complicated documents.
 
-Created with the help of GitHub Copilot and Claude Sonnet 4.6.
+Created with the help of GitHub Copilot and Claude Sonnet 4.6. High risk of
+failure but might be gradually improved.
 
 
 # HOW TO READ THE gitdiff.tex OUTPUT
