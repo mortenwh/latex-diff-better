@@ -122,13 +122,27 @@ _SECTION_HEADING_RE = re.compile(
 #   - Commands with optional [...] args (\cmd[...]) — ulem misparses [ as its own optional arg
 #   - Verbatim-style commands (different lexical mode)
 #   - Explicit line/paragraph breaks (interrupt \sout's horizontal-mode scan)
-# Note: commands with only brace arguments (\textbf{}, \ref{}, etc.) work fine inside \sout.
+#   - Commands that expand into PDF hyperlinks when hyperref is loaded — \cite*, \ac*,
+#     \gls*, \href, \url, \autoref, \nameref, \cref — because the hyperlink wrappers
+#     (\hyper@natlinkstart / \hyper@natlinkend) change PDF mode, which is incompatible
+#     with ulem's horizontal-mode box scanning. \url also changes catcodes (verbatim
+#     mode). All of these cause "Extra }, or forgotten \endgroup" / "Missing } inserted"
+#     errors when wrapped inside \sout{}.
+# Note: plain \textbf{}, \ref{}, \label{} etc. work fine inside \sout.
 _NOSOUT_RE = re.compile(
     r'\\[a-zA-Z]+\['            # \cmd[...] — optional arg confuses ulem
     r'|\\includegraphics\b'     # always has optional args in practice
     r'|\\verb\b|\\lstinline\b'  # verbatim
     r'|\\newline\b|\\par\b'     # line/paragraph breaks inside \sout cause errors
     r'|\\\\'                    # explicit \\ line break
+    # Hyperref-linked / catcode-changing commands — incompatible with \sout when
+    # hyperref is loaded (all four esa-* repos and most modern LaTeX docs use hyperref):
+    r'|\\url\b'                 # verbatim URL — catcode changes break ulem scanning
+    r'|\\href\b'                # hyperref link — PDF-mode wrapper
+    r'|\\cite[a-z]*\b'          # \cite, \citep, \citet, \citealp, etc.
+    r'|\\[aA][cC]?[splfuFiI]?\b'  # \ac, \acp, \Ac, \AC, \acl, \acs, \acf, \aclu, \acfu …
+    r'|\\[gG][lL][sS][a-zA-Z]*\b'  # \gls, \Gls, \GLS, \glspl, \glstext, etc.
+    r'|\\(?:name|auto|c)ref\b'  # \nameref, \autoref, \cref — hyperref cross-references
 )
 
 # Lines that must ALWAYS be output as ``% DIFF-DEL: ...`` comments rather than
@@ -183,10 +197,19 @@ def add_markup(text):
 
     Handles trailing LaTeX % comments correctly: the closing brace is placed
     before the % so it is not swallowed into the comment.
+
+    When the entire text is a LaTeX comment (e.g. "% note"), the text is
+    returned as-is: a comment added in the new version has no visible content
+    to colour and wrapping it would produce \\textcolor{ao}{}%..., which
+    comments out any markup following it on the same output line.
     """
     m = re.search(r'(?<!\\)%', text)
     if m:
-        return r'\textcolor{ao}{' + text[:m.start()] + '}' + text[m.start():]
+        before = text[:m.start()]
+        if not before.strip():
+            # Entire content is a comment — pass through without colour markup
+            return text
+        return r'\textcolor{ao}{' + before + '}' + text[m.start():]
     return r'\textcolor{ao}{' + text + '}'
 
 
@@ -995,9 +1018,18 @@ def diff_words_in_line(old_line, new_line):
     """
     Word-level diff between two single lines of plain text.
     Falls back to whole-line markup if the line is too complex for safe
-    token-level splitting (e.g. contains optional command arguments).
+    token-level splitting (e.g. contains optional command arguments or
+    inline LaTeX comments).
+
+    Lines containing an unescaped % always fall back to whole-line mode:
+    if a % token appeared in either half of the word diff, add_markup would
+    emit \\textcolor{ao}{}%..., starting a line comment that silences all
+    subsequent diff tokens on the same output line.  del_markup handles %
+    correctly at the full-line level by splitting off the comment suffix.
     """
-    if _COMPLEX_LINE_RE.search(old_line) or _COMPLEX_LINE_RE.search(new_line):
+    _has_comment = re.compile(r'(?<!\\)%')
+    if (_COMPLEX_LINE_RE.search(old_line) or _COMPLEX_LINE_RE.search(new_line)
+            or _has_comment.search(old_line) or _has_comment.search(new_line)):
         # Whole-line fallback: show delete then add
         result = []
         if old_line.strip():
@@ -1089,6 +1121,10 @@ def _safe_add_line(stripped, eol, line_orig):
     Lines are left unmarked when:
       - They are empty or consist solely of structural LaTeX commands — these
         are needed for document structure and must not be coloured.
+      - They are pure LaTeX comments (start with %) — wrapping them in
+        \\textcolor{ao}{} produces \\textcolor{ao}{}%..., which makes the `%`
+        start a line comment that hides all subsequent diff markup on the same
+        output line.
       - They contain optional argument syntax \\cmd[...] — wrapping such lines
         would break the command parsing (e.g. \\includepdf[...], \\csvlongtable).
       - They have unbalanced braces (part of a multi-line group).
@@ -1098,6 +1134,11 @@ def _safe_add_line(stripped, eol, line_orig):
     not inside \\textcolor{}{}.
     """
     if not stripped.strip() or is_structural(stripped):
+        return line_orig
+    # Pure LaTeX comment lines (% ...) must pass through unchanged.
+    # Wrapping in \textcolor{ao}{} would produce \textcolor{ao}{}%..., causing
+    # the % to comment out all following markup on that physical output line.
+    if re.match(r'[ \t]*%', stripped):
         return line_orig
     # Document-level or complex commands with optional args ([...]) must not be
     # wrapped in \textcolor{} — it would break commands like \includepdf, \csvlongtable
