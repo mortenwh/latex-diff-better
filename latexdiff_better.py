@@ -1476,36 +1476,77 @@ def diff_segments(old_segs, new_segs):
         elif tag == 'replace':
             ob = old_segs[i1:i2]
             nb = new_segs[j1:j2]
-            for k in range(max(len(ob), len(nb))):
-                if k < len(ob) and k < len(nb):
-                    ot, oc = ob[k]
-                    nt, nc = nb[k]
-                    if ot == 'table' and nt == 'table':
-                        result.append(diff_tables(oc, nc))
-                    elif ot == 'text' and nt == 'text':
-                        # If the new segment opens a float environment (table/figure),
-                        # place deleted content *before* the float rather than
-                        # interleaving it inside.  Interleaving puts deleted paragraphs
-                        # inside \begin{table}...\end{table}, making the float too
-                        # large for the page.
-                        if _FLOAT_ENV_OPEN_RE.search(nc):
-                            result.append(diff_text_block(oc, '') if oc.strip() else oc)
-                            result.append(diff_text_block('', nc) if nc.strip() else nc)
+
+            # Special case: one old text segment replaced by a mix of text and
+            # table segments (e.g. a new table was inserted in the middle of a
+            # text block, splitting it into text-before + table + text-after).
+            # Merging the new text segments for the line-level diff avoids the
+            # "delete all old content, insert all new content" failure mode and
+            # correctly shows only the actual additions and changes.  Inserted
+            # tables are shown as all-green at their natural insertion points via
+            # split markers that survive diff_text_block unchanged (they are pure
+            # LaTeX comment lines, which _safe_add_line passes through as-is).
+            _handled = False
+            if len(ob) == 1 and ob[0][0] == 'text':
+                _new_has_tables = any(t == 'table' for t, _ in nb)
+                _new_has_texts  = any(t == 'text'  for t, _ in nb)
+                if _new_has_tables and _new_has_texts:
+                    oc = ob[0][1]
+                    _combined_parts = []
+                    _tables_in_order = []
+                    for _seg_type, _seg_content in nb:
+                        if _seg_type == 'text':
+                            _combined_parts.append(_seg_content)
                         else:
-                            result.append(diff_text_block(oc, nc))
-                    else:
+                            _combined_parts.append(_TABLESPLIT_MARKER)
+                            _tables_in_order.append(_seg_content)
+                    _combined_new = ''.join(_combined_parts)
+                    _diff_out = (diff_text_block(oc, _combined_new)
+                                 if oc.strip() or _combined_new.strip()
+                                 else _combined_new)
+                    _diff_parts = _diff_out.split(_TABLESPLIT_MARKER)
+                    result.append(_diff_parts[0])
+                    for _tidx, _tc in enumerate(_tables_in_order):
+                        result.append(wrap_table_added(_tc))
+                        if _tidx + 1 < len(_diff_parts):
+                            result.append(_diff_parts[_tidx + 1])
+                    _handled = True
+
+            if not _handled:
+                for k in range(max(len(ob), len(nb))):
+                    if k < len(ob) and k < len(nb):
+                        ot, oc = ob[k]
+                        nt, nc = nb[k]
+                        if ot == 'table' and nt == 'table':
+                            result.append(diff_tables(oc, nc))
+                        elif ot == 'text' and nt == 'text':
+                            # If the new segment *starts* with a float environment
+                            # (table/figure), place deleted content before the float
+                            # rather than interleaving it inside.  Interleaving puts
+                            # deleted paragraphs inside \begin{table}…\end{table},
+                            # making the float too large for the page.
+                            # Use .match() (anchored) not .search() — searching
+                            # anywhere would trigger for any segment that merely
+                            # contains a float near its end, causing the entire old
+                            # block to be shown as deleted instead of line-diffed.
+                            if _FLOAT_ENV_OPEN_RE.match(nc.lstrip()):
+                                result.append(diff_text_block(oc, '') if oc.strip() else oc)
+                                result.append(diff_text_block('', nc) if nc.strip() else nc)
+                            else:
+                                result.append(diff_text_block(oc, nc))
+                        else:
+                            result.append(wrap_table_deleted(oc) if ot == 'table'
+                                          else diff_text_block(oc, '') if oc.strip() else oc)
+                            result.append(wrap_table_added(nc) if nt == 'table'
+                                          else diff_text_block('', nc) if nc.strip() else nc)
+                    elif k < len(ob):
+                        ot, oc = ob[k]
                         result.append(wrap_table_deleted(oc) if ot == 'table'
                                       else diff_text_block(oc, '') if oc.strip() else oc)
+                    else:
+                        nt, nc = nb[k]
                         result.append(wrap_table_added(nc) if nt == 'table'
                                       else diff_text_block('', nc) if nc.strip() else nc)
-                elif k < len(ob):
-                    ot, oc = ob[k]
-                    result.append(wrap_table_deleted(oc) if ot == 'table'
-                                  else diff_text_block(oc, '') if oc.strip() else oc)
-                else:
-                    nt, nc = nb[k]
-                    result.append(wrap_table_added(nc) if nt == 'table'
-                                  else diff_text_block('', nc) if nc.strip() else nc)
 
     return ''.join(result)
 
@@ -1787,10 +1828,19 @@ def diff_preamble_tables(old_preamble, new_preamble):
     return ''.join(result)
 
 
-# Matches the opening tag of a LaTeX float environment at the start of a text segment.
-# Used in diff_segments to detect new text segments that open a float, so that deleted
-# content from the old segment is placed before the float rather than inside it.
+# Matches a LaTeX float environment opening tag (table or figure).
+# Used with .match(nc.lstrip()) in diff_segments to detect new text segments that
+# *start* with a float, so that deleted content is placed before the float rather
+# than inside it.  The match is anchored to the start of the stripped segment — do
+# NOT use .search() here, which would trigger for any segment that merely contains
+# a float anywhere (e.g. near its end), causing the entire old text block to be
+# shown as deleted instead of doing a proper line-level diff.
 _FLOAT_ENV_OPEN_RE = re.compile(r'\\begin\{(table|figure)\*?\}')
+
+# Unique LaTeX comment line used as a split marker when merging new text segments
+# for a combined diff (see diff_segments replace handler).  Must be a valid LaTeX
+# comment so it passes through diff_text_block unchanged.
+_TABLESPLIT_MARKER = '% ==DIFF-TABLESPLIT==\n'
 
 
 def make_diff_legend_page(old_label: str, new_label: str) -> str:
