@@ -102,6 +102,11 @@ DIFF_PACKAGE_LINES = r"""\usepackage{ulem}
 DIFF_COLORS = r"""% --- diff colour definitions ---
 \definecolor{diffadd}{RGB}{198,239,206}
 \definecolor{diffdel}{RGB}{255,199,206}
+% Provide ao (green) and BUR (red) in case the source document does not define them.
+\makeatletter
+\@ifundefined{color@ao}{\definecolor{ao}{rgb}{0.0,0.5,0.0}}{}
+\@ifundefined{color@BUR}{\definecolor{BUR}{rgb}{0.8,0.0,0.0}}{}
+\makeatother
 """
 
 # Structural LaTeX commands that must NOT be wrapped in \sout{}
@@ -1473,7 +1478,16 @@ def diff_segments(old_segs, new_segs):
                     if ot == 'table' and nt == 'table':
                         result.append(diff_tables(oc, nc))
                     elif ot == 'text' and nt == 'text':
-                        result.append(diff_text_block(oc, nc))
+                        # If the new segment opens a float environment (table/figure),
+                        # place deleted content *before* the float rather than
+                        # interleaving it inside.  Interleaving puts deleted paragraphs
+                        # inside \begin{table}...\end{table}, making the float too
+                        # large for the page.
+                        if _FLOAT_ENV_OPEN_RE.search(nc):
+                            result.append(diff_text_block(oc, '') if oc.strip() else oc)
+                            result.append(diff_text_block('', nc) if nc.strip() else nc)
+                        else:
+                            result.append(diff_text_block(oc, nc))
                     else:
                         result.append(wrap_table_deleted(oc) if ot == 'table'
                                       else diff_text_block(oc, '') if oc.strip() else oc)
@@ -1768,6 +1782,63 @@ def diff_preamble_tables(old_preamble, new_preamble):
     return ''.join(result)
 
 
+# Matches the opening tag of a LaTeX float environment at the start of a text segment.
+# Used in diff_segments to detect new text segments that open a float, so that deleted
+# content from the old segment is placed before the float rather than inside it.
+_FLOAT_ENV_OPEN_RE = re.compile(r'\\begin\{(table|figure)\*?\}')
+
+
+def make_diff_legend_page(old_label: str, new_label: str) -> str:
+    """Return LaTeX source for a standalone legend page to prepend to the diff body.
+
+    The page lists the two compared versions and provides a visual key for all
+    diff markup styles used in the document.
+    """
+    return (
+        r'\clearpage' '\n'
+        r'\thispagestyle{empty}' '\n'
+        r'\begin{center}' '\n'
+        r'{\LARGE\bfseries Document Diff}\\[0.8em]' '\n'
+        r'{\large Comparison between two versions}\\[1.5em]' '\n'
+        r'\begin{tabular}{ll}' '\n'
+        r'  \textbf{Old version:} & \texttt{' + _tex_escape_label(old_label) + r'} \\' '\n'
+        r'  \textbf{New version:} & \texttt{' + _tex_escape_label(new_label) + r'} \\' '\n'
+        r'  \textbf{Generated:}   & \today \\' '\n'
+        r'\end{tabular}' '\n'
+        r'\end{center}' '\n'
+        r'\vspace{2em}' '\n'
+        r'{\large\bfseries Legend}\\[0.5em]' '\n'
+        r'\begin{tabular}{lp{0.75\textwidth}}' '\n'
+        r'  \colorbox{diffadd}{\phantom{XX}} & Added table row (green background) \\[0.4em]' '\n'
+        r'  \colorbox{diffdel}{\phantom{XX}} & Deleted table row (pink/red background) \\[0.4em]' '\n'
+        r'  \textcolor{ao}{Green text} & Text added in the new version \\[0.4em]' '\n'
+        r'  \textcolor{BUR}{\sout{Red strikethrough}} & Text deleted from the old version (inline content) \\[0.4em]' '\n'
+        r'  {\color{BUR}Red (no strikethrough)} & Text deleted from the old version (complex/structural content) \\[0.4em]' '\n'
+        r'  \texttt{\% DIFF-DEL: \ldots} & Structurally deleted \LaTeX{} commands (commented out) \\' '\n'
+        r'\end{tabular}' '\n'
+        r'\clearpage' '\n'
+    )
+
+
+def _tex_escape_label(s: str) -> str:
+    """Escape characters that are special in LaTeX so version labels render safely."""
+    replacements = [
+        ('\\', r'\textbackslash{}'),
+        ('_', r'\_'),
+        ('^', r'\^{}'),
+        ('%', r'\%'),
+        ('$', r'\$'),
+        ('#', r'\#'),
+        ('&', r'\&'),
+        ('{', r'\{'),
+        ('}', r'\}'),
+        ('~', r'\textasciitilde{}'),
+    ]
+    for old, new in replacements:
+        s = s.replace(old, new)
+    return s
+
+
 def inject_diff_packages(preamble):
     """Insert ulem, colortbl and colour definitions after the last \\usepackage line.
 
@@ -1856,6 +1927,8 @@ def main():
     if len(sys.argv) == 4 and sys.argv[1] != '--git':
         # Standard two-file mode
         old_path, new_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+        old_label = old_path
+        new_label = new_path
         with open(old_path, encoding='utf-8') as f:
             old_text = f.read()
         with open(new_path, encoding='utf-8') as f:
@@ -1909,6 +1982,7 @@ def main():
             sys.exit(1)
 
         main_rel = os.path.relpath(main_tex, repo_dir) if os.path.isabs(main_tex) else main_tex
+        old_label = old_commit
 
         old_main = git_show(repo_dir, old_commit, main_rel)
         if old_main is None:
@@ -1918,6 +1992,7 @@ def main():
 
         if new_commit is None:
             # Compare against working tree
+            new_label = f'{main_rel} (working tree)'
             new_main_path = os.path.join(repo_dir, main_rel)
             with open(new_main_path, encoding='utf-8') as f:
                 new_text = flatten_from_disk(f.read(), repo_dir)
@@ -1926,6 +2001,7 @@ def main():
                 return open(full, encoding='utf-8').read() if os.path.exists(full) else None
         else:
             # Two-commit mode: read new version from git as well
+            new_label = new_commit
             new_main = git_show(repo_dir, new_commit, main_rel)
             if new_main is None:
                 print(f'Error: {main_rel} not found at commit {new_commit}', file=sys.stderr)
@@ -1964,8 +2040,11 @@ def main():
     new_segs = segment_text(new_body)
     out_body = diff_segments(old_segs, new_segs)
 
+    legend_page = make_diff_legend_page(old_label, new_label)
+
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(out_preamble)
+        f.write('\n' + legend_page)
         f.write(out_body)
 
     n_body = sum(1 for t, _ in new_segs if t == 'table')
