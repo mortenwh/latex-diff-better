@@ -171,7 +171,12 @@ _COMMENT_DEL_RE = re.compile(
     # float-specific commands (must be inside a figure/table float)
     r'|\\caption\b|\\subcaption\b|\\captionof\b'
     # acronym / glossaries list-entry commands (must be inside their environment)
-    r'|\\acro\b|\\acrodef\b|\\newacronym\b|\\newglossaryentry\b',
+    r'|\\acro\b|\\acrodef\b|\\newacronym\b|\\newglossaryentry\b'
+    # bibliography commands — write \bibstyle/\bibdata to .aux; executing both
+    # old and new versions causes duplicate entries that make bibtex abort with
+    # "Illegal, another \bibstyle command".  Deleted versions must be comments;
+    # added/unchanged versions must pass through as-is (no colour wrapping).
+    r'|\\bibliographystyle\b|\\bibliography\b|\\addbibresource\b',
 )
 
 

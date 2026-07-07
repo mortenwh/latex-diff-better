@@ -336,6 +336,100 @@ class TestBug5AcMultiCharSuffixNotInSout:
 
 
 # ---------------------------------------------------------------------------
+# Bug 6 — \bibliographystyle / \bibliography must not be colour-wrapped
+# ---------------------------------------------------------------------------
+
+class TestBibliographyCommandsNotWrapped:
+    r"""Bug 6: \bibliographystyle, \bibliography, and \addbibresource write
+    \bibstyle / \bibdata to the .aux file.  When both the deleted and added
+    versions are executed (because they are wrapped in \textcolor{}{} or
+    \sout{}), the .aux file ends up with duplicate entries and bibtex aborts
+    with "Illegal, another \bibstyle command".
+
+    Fix: add these commands to _COMMENT_DEL_RE so that:
+      - deleted versions become ``% DIFF-DEL:`` comments (not executed), and
+      - added/unchanged versions pass through as-is without colour wrapping.
+    """
+
+    def test_deleted_bibliographystyle_becomes_comment(self):
+        r"""Deleted \bibliographystyle must become a % DIFF-DEL comment, not execute."""
+        old = r"\bibliographystyle{ieeetr}" + "\n"
+        new = ""
+        out = run_diff(old, new)
+        assert '% DIFF-DEL:' in out, r"Deleted \bibliographystyle must become % DIFF-DEL: comment"
+        assert r'\bibliographystyle{ieeetr}' not in out.replace('% DIFF-DEL: \\bibliographystyle{ieeetr}', ''), (
+            r"Deleted \bibliographystyle must not appear as an active LaTeX command"
+        )
+
+    def test_deleted_bibliography_becomes_comment(self):
+        r"""Deleted \bibliography must become a % DIFF-DEL comment, not execute."""
+        old = r"\bibliography{references}" + "\n"
+        new = ""
+        out = run_diff(old, new)
+        assert '% DIFF-DEL:' in out, r"Deleted \bibliography must become % DIFF-DEL: comment"
+
+    def test_added_bibliographystyle_passes_through_unchanged(self):
+        r"""Added \bibliographystyle must pass through as-is — no \textcolor{ao}{} wrapping."""
+        old = ""
+        new = r"\bibliographystyle{ieeetr}" + "\n"
+        out = run_diff(old, new)
+        # The command must appear in the output
+        assert r'\bibliographystyle{ieeetr}' in out
+        # It must NOT be wrapped in \textcolor{ao}{...}
+        assert r'\textcolor{ao}{\bibliographystyle' not in out, (
+            r"Added \bibliographystyle must not be wrapped in \textcolor{ao}{}"
+        )
+
+    def test_added_bibliography_passes_through_unchanged(self):
+        r"""Added \bibliography must pass through as-is — no \textcolor{ao}{} wrapping."""
+        old = ""
+        new = r"\bibliography{references}" + "\n"
+        out = run_diff(old, new)
+        assert r'\bibliography{references}' in out
+        assert r'\textcolor{ao}{\bibliography' not in out, (
+            r"Added \bibliography must not be wrapped in \textcolor{ao}{}"
+        )
+
+    def test_replaced_bibliographystyle_old_commented_new_unchanged(self):
+        r"""Replaced \bibliographystyle: old → comment, new → as-is (no colour wrap)."""
+        old = r"\bibliographystyle{plain}" + "\n"
+        new = r"\bibliographystyle{ieeetr}" + "\n"
+        out = run_diff(old, new)
+        assert '% DIFF-DEL:' in out and 'plain' in out, (
+            r"Old \bibliographystyle must appear as % DIFF-DEL comment"
+        )
+        assert r'\bibliographystyle{ieeetr}' in out
+        assert r'\textcolor{ao}{\bibliographystyle' not in out, (
+            r"New \bibliographystyle must not be wrapped in \textcolor{ao}{}"
+        )
+
+    def test_no_duplicate_bibliography_commands_when_unchanged(self):
+        r"""Unchanged \bibliography must appear exactly once — no colour-wrapped duplicates."""
+        body = r"\bibliography{references}" + "\n"
+        out = run_diff(body, body)
+        assert out.count(r'\bibliography{references}') == 1, (
+            r"Unchanged \bibliography must appear exactly once in the output"
+        )
+
+    def test_deleted_addbibresource_becomes_comment(self):
+        r"""Deleted \addbibresource (biblatex) must become a % DIFF-DEL comment."""
+        old = r"\addbibresource{references.bib}" + "\n"
+        new = ""
+        out = run_diff(old, new)
+        assert '% DIFF-DEL:' in out, r"Deleted \addbibresource must become % DIFF-DEL: comment"
+
+    def test_added_addbibresource_passes_through_unchanged(self):
+        r"""Added \addbibresource must pass through as-is — no \textcolor{ao}{} wrapping."""
+        old = ""
+        new = r"\addbibresource{references.bib}" + "\n"
+        out = run_diff(old, new)
+        assert r'\addbibresource{references.bib}' in out
+        assert r'\textcolor{ao}{\addbibresource' not in out, (
+            r"Added \addbibresource must not be wrapped in \textcolor{ao}{}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Bug 3 regression — diff_preamble_tables is now wired into main pipeline
 # ---------------------------------------------------------------------------
 
