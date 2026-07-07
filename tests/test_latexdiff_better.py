@@ -450,3 +450,317 @@ class TestRegression:
         out = run_diff(old, new)
         assert r'\begin{tabular}' in out
         assert 'Second' in out
+
+
+# ---------------------------------------------------------------------------
+# Bug 6 — parse_table_rows / split_cells must not split inside brace groups
+# ---------------------------------------------------------------------------
+
+class TestBug6BraceAwareSplitting:
+    r"""Bug 6: \\ inside \makecell{...\\ ...} (or any braced argument) must
+    not be treated as a table row terminator.  Likewise, & inside a brace
+    group must not be treated as a cell separator.
+
+    Root cause: parse_table_rows() used a plain regex to split on all \\
+    tokens, and split_cells() used re.split(r'(?<!\\)&', body).  Neither
+    respected brace depth, so \makecell{A \\ B} got split into two fragments
+    with unbalanced braces, producing LaTeX compilation errors.
+    """
+
+    # -----------------------------------------------------------------------
+    # Shared fixtures
+    # -----------------------------------------------------------------------
+
+    SIMPLE_TABLE = (
+        r"\begin{tabular}{ll}" + "\n"
+        r"\makecell{A \\ B} & Col2 \\" + "\n"
+        r"Row2 & Data \\" + "\n"
+        r"\end{tabular}"
+    )
+
+    REAL_TABLE = (
+        r"\begin{tabular}{lll}" + "\n"
+        r"\toprule" + "\n"
+        r"\textbf{Active Sensor} & "
+        r"\multicolumn{2}{r}{\makecell[l]{\textbf{Wind} \\ \textbf{Source}}} \\" + "\n"
+        r"\midrule" + "\n"
+        r"ALOS & ASCAT & Ref \\" + "\n"
+        r"\bottomrule" + "\n"
+        r"\end{tabular}"
+    )
+
+    # -----------------------------------------------------------------------
+    # parse_table_rows unit tests
+    # -----------------------------------------------------------------------
+
+    def test_makecell_not_split_row_count(self):
+        r"""\\ inside \makecell{} must not create extra rows."""
+        _, rows, _, _ = ldb.parse_table_rows(self.SIMPLE_TABLE)
+        data_rows = [r for r in rows if r.strip()]
+        assert len(data_rows) == 2, (
+            f"Expected 2 rows, got {len(data_rows)}: {data_rows!r}"
+        )
+
+    def test_makecell_rows_brace_balanced(self):
+        r"""Every row from parse_table_rows must have balanced braces."""
+        _, rows, _, _ = ldb.parse_table_rows(self.SIMPLE_TABLE)
+        for r in rows:
+            assert ldb._brace_balanced(r), (
+                f"Row has unbalanced braces: {r!r}"
+            )
+
+    def test_makecell_no_row_starts_with_closing_brace(self):
+        r"""No row should start with 'B}' — a sign that \\ inside \makecell was a split point."""
+        _, rows, _, _ = ldb.parse_table_rows(self.SIMPLE_TABLE)
+        for r in rows:
+            assert not r.strip().startswith('B}'), (
+                f"Row starts with 'B}}' indicating \\\\ inside \\makecell was used "
+                f"as row separator: {r!r}"
+            )
+
+    def test_multicolumn_makecell_not_split(self):
+        r"""\\ inside \multicolumn arg with \makecell must not split the row."""
+        table = (
+            r"\begin{tabular}{lll}" + "\n"
+            r"\multicolumn{2}{r}{\makecell[l]{Wind \\ Source}} & Extra \\" + "\n"
+            r"Row2 & Data & More \\" + "\n"
+            r"\end{tabular}"
+        )
+        _, rows, _, _ = ldb.parse_table_rows(table)
+        data_rows = [r for r in rows if r.strip()]
+        assert len(data_rows) == 2, (
+            f"Expected 2 rows, got {len(data_rows)}: {data_rows!r}"
+        )
+        assert r'\makecell[l]{Wind \\ Source}' in data_rows[0], (
+            f"\\makecell content split across rows. First row: {data_rows[0]!r}"
+        )
+
+    def test_parbox_line_break_not_split(self):
+        r"""\\ inside \parbox must not split the row."""
+        table = (
+            r"\begin{tabular}{ll}" + "\n"
+            r"\parbox{3cm}{Line1 \\ Line2} & B \\" + "\n"
+            r"C & D \\" + "\n"
+            r"\end{tabular}"
+        )
+        _, rows, _, _ = ldb.parse_table_rows(table)
+        data_rows = [r for r in rows if r.strip()]
+        assert len(data_rows) == 2, (
+            f"Expected 2 data rows, got {len(data_rows)}: {data_rows!r}"
+        )
+        for r in data_rows:
+            assert ldb._brace_balanced(r), f"Unbalanced braces in row: {r!r}"
+
+    def test_shortstack_line_break_not_split(self):
+        r"""\\ inside \shortstack must not split the row."""
+        table = (
+            r"\begin{tabular}{ll}" + "\n"
+            r"\shortstack{A \\ B} & Col2 \\" + "\n"
+            r"Row2 & Data \\" + "\n"
+            r"\end{tabular}"
+        )
+        _, rows, _, _ = ldb.parse_table_rows(table)
+        data_rows = [r for r in rows if r.strip()]
+        assert len(data_rows) == 2, (
+            f"Expected 2 data rows, got {len(data_rows)}: {data_rows!r}"
+        )
+
+    def test_nested_braces_not_split(self):
+        r"""\\ inside nested braces \textbf{\makecell{A \\ B}} must not split the row."""
+        table = (
+            r"\begin{tabular}{ll}" + "\n"
+            r"\textbf{\makecell{A \\ B}} & Col2 \\" + "\n"
+            r"\end{tabular}"
+        )
+        _, rows, _, _ = ldb.parse_table_rows(table)
+        data_rows = [r for r in rows if r.strip()]
+        assert len(data_rows) == 1, (
+            f"Expected 1 data row, got {len(data_rows)}: {data_rows!r}"
+        )
+        assert ldb._brace_balanced(data_rows[0]), (
+            f"Row must have balanced braces: {data_rows[0]!r}"
+        )
+
+    def test_row_sep_at_depth0_is_split(self):
+        r"""\\ at brace depth 0 IS a row separator (normal case preserved)."""
+        table = (
+            r"\begin{tabular}{ll}" + "\n"
+            r"A & B \\" + "\n"
+            r"C & D \\" + "\n"
+            r"\end{tabular}"
+        )
+        _, rows, _, _ = ldb.parse_table_rows(table)
+        data_rows = [r for r in rows if r.strip()]
+        assert len(data_rows) == 2, (
+            f"Expected 2 data rows, got {len(data_rows)}: {data_rows!r}"
+        )
+
+    def test_row_sep_with_height_preserved(self):
+        r"""\\[5pt] at brace depth 0 is a row separator with height (preserved)."""
+        table = (
+            r"\begin{tabular}{ll}" + "\n"
+            r"A & B \\[5pt]" + "\n"
+            r"C & D \\" + "\n"
+            r"\end{tabular}"
+        )
+        _, rows, _, _ = ldb.parse_table_rows(table)
+        data_rows = [r for r in rows if r.strip()]
+        assert len(data_rows) == 2, (
+            f"Expected 2 data rows, got {len(data_rows)}: {data_rows!r}"
+        )
+        assert r'\\[5pt]' in data_rows[0], (
+            f"Row height adjustment \\\\[5pt] must be preserved: {data_rows[0]!r}"
+        )
+
+    def test_mixed_table_correct_row_count(self):
+        r"""Table with \makecell rows and plain rows has correct row count."""
+        table = (
+            r"\begin{tabular}{ll}" + "\n"
+            r"\toprule" + "\n"
+            r"\makecell{H1 \\ Sub1} & \makecell{H2 \\ Sub2} \\" + "\n"
+            r"\midrule" + "\n"
+            r"Plain A & Plain B \\" + "\n"
+            r"\makecell{Multi \\ Line} & Value \\" + "\n"
+            r"\bottomrule" + "\n"
+            r"\end{tabular}"
+        )
+        _, rows, _, _ = ldb.parse_table_rows(table)
+        data_rows = [r for r in rows if '&' in r]
+        assert len(data_rows) == 3, (
+            f"Expected 3 data rows, got {len(data_rows)}: {data_rows!r}"
+        )
+        for r in rows:
+            assert ldb._brace_balanced(r), f"Row has unbalanced braces: {r!r}"
+
+    # -----------------------------------------------------------------------
+    # split_cells unit tests
+    # -----------------------------------------------------------------------
+
+    def test_split_cells_normal(self):
+        """Normal & at depth 0 splits cells correctly."""
+        row = r"A & B & C \\"
+        cells = ldb.split_cells(row)
+        assert len(cells) == 3, f"Expected 3 cells, got {cells!r}"
+        assert cells[0].strip() == 'A'
+        assert cells[1].strip() == 'B'
+        assert cells[2].strip() == 'C'
+
+    def test_split_cells_escaped_amp_regression(self):
+        r"""Escaped \& must not be treated as a cell separator."""
+        row = r"Price: 10\,\$ \& 20\,\$ & Value \\"
+        cells = ldb.split_cells(row)
+        assert len(cells) == 2, (
+            f"Expected 2 cells (\\& is not a separator), got {cells!r}"
+        )
+
+    def test_split_cells_amp_inside_braces(self):
+        r"""& inside a brace group must not split cells."""
+        row = r"\multicolumn{2}{r}{\mbox{A & B}} & Last \\"
+        cells = ldb.split_cells(row)
+        assert len(cells) == 2, (
+            f"Expected 2 cells (& inside braces is not a separator), got {len(cells)}: {cells!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # render_added_row / render_deleted_row unit tests
+    # -----------------------------------------------------------------------
+
+    def test_render_added_row_makecell_balanced(self):
+        r"""render_added_row must produce balanced braces on a row with \makecell."""
+        row = r"\makecell{Wind \\ Source} & Value \\"
+        result = ldb.render_added_row(row)
+        assert ldb._brace_balanced(result), (
+            f"render_added_row output has unbalanced braces: {result!r}"
+        )
+
+    def test_render_added_row_multicolumn_makecell_balanced(self):
+        r"""render_added_row on \multicolumn+\makecell must produce balanced braces."""
+        row = (
+            r"\multicolumn{2}{r}{\makecell[l]{\textbf{Wind} \\ \textbf{Source}}}"
+            r" & Extra \\"
+        )
+        result = ldb.render_added_row(row)
+        assert ldb._brace_balanced(result), (
+            f"Output has unbalanced braces: {result!r}"
+        )
+        assert r'\makecell[l]{' in result, (
+            f"\\makecell was removed or corrupted: {result!r}"
+        )
+
+    def test_render_deleted_row_makecell_balanced(self):
+        r"""render_deleted_row must produce balanced braces on a row with \makecell."""
+        row = r"\makecell{A \\ B} & Value \\"
+        cells = ldb.split_cells(row)
+        n_cols = 2
+        trailing = r"\\"
+        result = ldb.render_deleted_row(cells, n_cols, trailing)
+        assert ldb._brace_balanced(result), (
+            f"render_deleted_row output has unbalanced braces: {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # wrap_table_added / wrap_table_deleted integration tests
+    # -----------------------------------------------------------------------
+
+    def test_wrap_table_added_balanced_braces(self):
+        r"""wrap_table_added on a table with \makecell multi-line header → balanced braces."""
+        result = ldb.wrap_table_added(self.REAL_TABLE)
+        assert ldb._brace_balanced(result), (
+            f"wrap_table_added output has unbalanced braces: {result!r}"
+        )
+
+    def test_wrap_table_added_cellcolor_not_inside_makecell(self):
+        r"""wrap_table_added must not inject \cellcolor inside \makecell content."""
+        result = ldb.wrap_table_added(self.REAL_TABLE)
+        # If \cellcolor appears between \makecell{ and the matching }, that is a bug.
+        # Simple regression check: the broken pattern from the bug report must not appear.
+        assert r'\cellcolor{diffadd}\textbf{Source}' not in result, (
+            r"\cellcolor was incorrectly injected as a continuation of \makecell content"
+        )
+
+    def test_wrap_table_deleted_balanced_braces(self):
+        r"""wrap_table_deleted on a table with \makecell multi-line header → balanced braces."""
+        result = ldb.wrap_table_deleted(self.REAL_TABLE)
+        assert ldb._brace_balanced(result), (
+            f"wrap_table_deleted output has unbalanced braces: {result!r}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Full diff pipeline integration tests
+    # -----------------------------------------------------------------------
+
+    def _make_table_doc(self, table_body):
+        preamble = (
+            r"\documentclass{article}" + "\n"
+            r"\usepackage{tabularx}" + "\n"
+            r"\usepackage{booktabs}" + "\n"
+            r"\usepackage{makecell}" + "\n"
+            r"\begin{document}" + "\n"
+        )
+        return preamble + table_body + "\n" + r"\end{document}"
+
+    def test_diff_pipeline_added_table_with_makecell(self):
+        r"""Full diff: added table with \makecell{...\\ ...} → balanced braces in output."""
+        old_text = self._make_table_doc("")
+        new_text = self._make_table_doc(self.REAL_TABLE)
+        old_p, old_b = ldb.split_preamble_body(old_text)
+        new_p, new_b = ldb.split_preamble_body(new_text)
+        out_p = ldb.inject_diff_packages(new_p)
+        out_body = ldb.diff_segments(ldb.segment_text(old_b), ldb.segment_text(new_b))
+        output = out_p + out_body
+        assert ldb._brace_balanced(output), (
+            "Full diff output has unbalanced braces for added table with \\makecell"
+        )
+
+    def test_diff_pipeline_deleted_table_with_makecell(self):
+        r"""Full diff: deleted table with \makecell{...\\ ...} → balanced braces in output."""
+        old_text = self._make_table_doc(self.REAL_TABLE)
+        new_text = self._make_table_doc("")
+        old_p, old_b = ldb.split_preamble_body(old_text)
+        new_p, new_b = ldb.split_preamble_body(new_text)
+        out_p = ldb.inject_diff_packages(new_p)
+        out_body = ldb.diff_segments(ldb.segment_text(old_b), ldb.segment_text(new_b))
+        output = out_p + out_body
+        assert ldb._brace_balanced(output), (
+            "Full diff output has unbalanced braces for deleted table with \\makecell"
+        )
