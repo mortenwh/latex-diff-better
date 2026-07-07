@@ -414,18 +414,57 @@ def segment_text(text):
 # Row and cell parsing
 # ---------------------------------------------------------------------------
 
+def _split_brace_aware(text, sep_char):
+    r"""Split *text* at *sep_char* characters that are at brace depth 0.
+
+    Escaped characters (preceded by \) and any character inside a brace
+    group {…} are never treated as separators.  This prevents & and \\
+    tokens inside \makecell{}, \parbox{}, \multicolumn args, etc. from
+    being mistaken for cell or row separators.
+    """
+    parts = []
+    current = []
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '\\':
+            # Skip the next character unconditionally (escape sequence).
+            current.append(c)
+            if i + 1 < n:
+                current.append(text[i + 1])
+            i += 2
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        elif c == sep_char and depth == 0:
+            parts.append(''.join(current))
+            current = []
+            i += 1
+            continue
+        current.append(c)
+        i += 1
+    parts.append(''.join(current))
+    return parts
+
+
 def split_cells(row_text):
     """Split a table row into individual cell strings.
 
-    Splits on unescaped & only (not \\&).  Leading structural commands
-    (\\hline, \\endhead, …) are stripped first via row_leading() so they do
-    not end up in the first cell.  The trailing \\\\ row-end marker and any
-    following \\hline are also removed before splitting.
+    Splits on unescaped & only (not \\&), and never splits inside brace
+    groups (e.g. inside \\makecell{} or \\multicolumn arguments).  Leading
+    structural commands (\\hline, \\endhead, …) are stripped first via
+    row_leading() so they do not end up in the first cell.  The trailing
+    \\\\ row-end marker and any following \\hline are also removed before
+    splitting.
     """
     body = row_text[len(row_leading(row_text)):]
     # Remove trailing \\ (row end marker) and \hline
     body = re.sub(r'(\\\\(?:\[.*?\])?(?:\s*\\hline)*)$', '', body)
-    return [c.strip() for c in re.split(r'(?<!\\)&', body)]
+    return [c.strip() for c in _split_brace_aware(body, '&')]
 
 
 def count_cells(row_text):
@@ -436,7 +475,7 @@ def count_cells(row_text):
     """
     body = row_text[len(row_leading(row_text)):]
     body = re.sub(r'(\\\\(?:\[.*?\])?(?:\s*\\hline)*)$', '', body)
-    return len(re.findall(r'(?<!\\)&', body))
+    return len(_split_brace_aware(body, '&')) - 1
 
 
 def row_trailing(row_text):
@@ -516,10 +555,65 @@ def row_leading(row_text):
     return m.group() if m else ''
 
 
+def _split_rows_brace_aware(body):
+    r"""Split a table body string into rows on \\ tokens at brace depth 0.
+
+    A \\ token that appears inside a brace group — e.g. inside
+    \makecell{Wind \\ Speed}, \parbox{2cm}{A \\ B}, or any other braced
+    argument — is NOT treated as a row terminator.  Only \\ at depth 0
+    (outside all brace groups) terminates a row.
+
+    The separator (including optional \\[dim] height and any trailing
+    \hline commands) is attached to the *preceding* row, matching the
+    contract of the original regex-based split.
+    """
+    # Regex for the full row-end token: \\ with optional [dim] and \hline(s)
+    row_end_re = re.compile(r'\\\\(?:\[.*?\])?(?:\s*\\hline)*')
+
+    rows = []
+    current = []
+    depth = 0
+    i = 0
+    n = len(body)
+
+    while i < n:
+        c = body[i]
+        if c == '\\':
+            if depth == 0 and i + 1 < n and body[i + 1] == '\\':
+                # Candidate row terminator — match full token (\\[dim]\hline*)
+                m = row_end_re.match(body, i)
+                if m:
+                    current.append(m.group())
+                    rows.append(''.join(current))
+                    current = []
+                    i = m.end()
+                    continue
+            # Regular escape sequence: consume two characters unchanged.
+            current.append(c)
+            if i + 1 < n:
+                current.append(body[i + 1])
+            i += 2
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        current.append(c)
+        i += 1
+
+    if current:
+        rows.append(''.join(current))
+    return rows
+
+
 def parse_table_rows(table_content):
     """
     Parse a table environment into (begin_tag, rows, end_tag, env_name).
     Each row is the raw text including its trailing \\\\.
+
+    Row splitting is brace-depth-aware: \\\\ tokens inside brace groups
+    (e.g. inside \\makecell{A \\\\ B} or \\parbox arguments) are NOT
+    treated as row terminators.
     """
     m_env = re.match(r'\\begin\{([^}]+)\}', table_content)
     if not m_env:
@@ -529,19 +623,7 @@ def parse_table_rows(table_content):
     begin_tag, body_and_end = parse_begin_tag(table_content)
     body, end_tag = parse_end_tag(body_and_end, env_name)
 
-    # Split body on \\ separators, keeping the separator attached to the preceding row
-    row_sep = re.compile(r'(\\\\(?:\[.*?\])?(?:\s*\\hline)*)')
-    parts = row_sep.split(body)
-
-    rows = []
-    i = 0
-    while i < len(parts):
-        if i + 1 < len(parts) and row_sep.fullmatch(parts[i + 1]):
-            rows.append(parts[i] + parts[i + 1])
-            i += 2
-        else:
-            rows.append(parts[i])
-            i += 1
+    rows = _split_rows_brace_aware(body)
 
     # Move longtable/xltabular header rows (up to and including \endhead or
     # \endfirsthead) into begin_tag.  This prevents the \endhead marker from
