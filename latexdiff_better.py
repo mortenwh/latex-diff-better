@@ -128,6 +128,8 @@ _SECTION_HEADING_RE = re.compile(
 #     with ulem's horizontal-mode box scanning. \url also changes catcodes (verbatim
 #     mode). All of these cause "Extra }, or forgotten \endgroup" / "Missing } inserted"
 #     errors when wrapped inside \sout{}.
+#     The \ac*/\Ac*/\AC* family uses [a-zA-Z]* to catch all multi-char suffixes
+#     (\acfi, \aclu, \acfu, \acsf, …).
 # Note: plain \textbf{}, \ref{}, \label{} etc. work fine inside \sout.
 _NOSOUT_RE = re.compile(
     r'\\[a-zA-Z]+\['            # \cmd[...] — optional arg confuses ulem
@@ -140,7 +142,7 @@ _NOSOUT_RE = re.compile(
     r'|\\url\b'                 # verbatim URL — catcode changes break ulem scanning
     r'|\\href\b'                # hyperref link — PDF-mode wrapper
     r'|\\cite[a-z]*\b'          # \cite, \citep, \citet, \citealp, etc.
-    r'|\\[aA][cC]?[splfuFiI]?\b'  # \ac, \acp, \Ac, \AC, \acl, \acs, \acf, \aclu, \acfu …
+    r'|\\[aA][cC][a-zA-Z]*\b'  # \ac, \acp, \acl, \acf, \acfi, \aclu, \acfu, \Ac, \AC, etc.
     r'|\\[gG][lL][sS][a-zA-Z]*\b'  # \gls, \Gls, \GLS, \glspl, \glstext, etc.
     r'|\\(?:name|auto|c)ref\b'  # \nameref, \autoref, \cref — hyperref cross-references
 )
@@ -1088,6 +1090,11 @@ def _safe_del_line(stripped, eol, show_section_note=True, force_comment=False):
     """
     if not stripped.strip():
         return ''
+    # Pure LaTeX comment lines (% ...) must not be wrapped in del_markup() —
+    # del_markup() splits at % and returns \textcolor{BUR}{\sout{}}% ... with an
+    # empty strikethrough box.  Comment them out as DIFF-DEL instead.
+    if re.match(r'[ \t]*%', stripped):
+        return '% DIFF-DEL: ' + stripped + eol
     # Never execute deleted \begin / \end — they would open real environments.
     # Never execute deleted \item — it requires its parent list environment,
     # which is itself commented out.
@@ -1557,6 +1564,9 @@ def expand_all_csv_commands(old_text, new_text, old_loader, new_loader):
     old_loader(path) / new_loader(path) are callables that return the CSV file
     content as a string, or None if the file does not exist at that version
     (in which case the \\cmd{file} token is left unchanged).
+
+    Returns (old_expanded, new_expanded, any_expanded) where any_expanded is True
+    only if at least one CSV file was actually loaded and replaced.
     """
     def make_replacer(cmd_name, loader):
         def replacer(m):
@@ -1570,14 +1580,13 @@ def expand_all_csv_commands(old_text, new_text, old_loader, new_loader):
             return csv_to_xltabular(rows, cmd_name)
         return replacer
 
-    expanded = False
+    old_original, new_original = old_text, new_text
     for cmd in CSV_COMMANDS:
         pat = re.compile(r'\\' + re.escape(cmd) + r'\{([^}]+)\}')
-        if pat.search(old_text) or pat.search(new_text):
-            expanded = True
         old_text = pat.sub(make_replacer(cmd, old_loader), old_text)
         new_text = pat.sub(make_replacer(cmd, new_loader), new_text)
-    return old_text, new_text, expanded
+    any_expanded = (old_text != old_original or new_text != new_original)
+    return old_text, new_text, any_expanded
 
 def git_show(repo, commit, path):
     """Return the text content of <path> at <commit> in git repo <repo>, or None if absent."""
@@ -1739,12 +1748,15 @@ def main():
 
     Two modes:
       Standard:  old.tex new.tex output.tex
-        Reads two standalone .tex files and diffs them directly.
+        Reads two standalone .tex files, flattens \\include/\\input sub-files,
+        expands CSV table commands, and diffs them directly.
 
-      Git mode:  --git [<repo_dir>] <old_commit> <main.tex> output.tex
+      Git mode:  --git [<repo_dir>] <old_commit> [<new_commit>] <main.tex> output.tex
         If <repo_dir> is omitted the current working directory is used as the repo.
+        If <new_commit> is omitted the working tree is used as the new version.
         1. Reads main.tex and all its \\include'd sub-files at old_commit from git.
-        2. Reads the current working-tree versions from disk.
+        2. Reads the new version either from the working tree (default) or from
+           <new_commit> in git (two-commit mode).
         3. Expands \\csvlongtable / \\csvlongtbd / \\csvlongtrace in both versions.
         4. Runs the shared diff pipeline on the flattened+expanded texts.
 
@@ -1761,17 +1773,53 @@ def main():
             old_text = f.read()
         with open(new_path, encoding='utf-8') as f:
             new_text = f.read()
+        # Flatten \include / \input sub-files (same as git mode does)
+        old_dir = os.path.dirname(os.path.abspath(old_path))
+        new_dir = os.path.dirname(os.path.abspath(new_path))
+        old_text = flatten_from_disk(old_text, old_dir)
+        new_text = flatten_from_disk(new_text, new_dir)
+        # Expand CSV-backed table commands using disk loaders for both versions
+        def _old_csv_loader(path):
+            full = os.path.join(old_dir, path)
+            return open(full, encoding='utf-8').read() if os.path.exists(full) else None
+        def _new_csv_loader(path):
+            full = os.path.join(new_dir, path)
+            return open(full, encoding='utf-8').read() if os.path.exists(full) else None
+        old_text, new_text, csv_expanded = expand_all_csv_commands(
+            old_text, new_text, _old_csv_loader, _new_csv_loader
+        )
+        if csv_expanded:
+            print('CSV tables expanded for diffing')
 
-    elif sys.argv[1] == '--git' and len(sys.argv) in (5, 6):
-        if len(sys.argv) == 5:
-            # Git mode (no repo_dir): --git <old_commit> <main.tex> <output.tex>
-            # repo_dir defaults to the current working directory
-            _, _, old_commit, main_tex, out_path = sys.argv
-            repo_dir = os.path.abspath(os.getcwd())
+    elif sys.argv[1] == '--git' and len(sys.argv) in (5, 6, 7):
+        # Git mode argument parsing.  The optional <repo_dir> is distinguished from
+        # a commit hash by checking whether the first positional argument is a directory.
+        #
+        # Supported forms:
+        #   --git <old_commit> <main.tex> <output.tex>              (repo = cwd)
+        #   --git <repo_dir> <old_commit> <main.tex> <output.tex>
+        #   --git <old_commit> <new_commit> <main.tex> <output.tex> (repo = cwd)
+        #   --git <repo_dir> <old_commit> <new_commit> <main.tex> <output.tex>
+        args = sys.argv[2:]  # everything after --git
+        if os.path.isdir(args[0]):
+            repo_dir = os.path.abspath(args[0])
+            args = args[1:]
         else:
-            # Git mode: --git <repo_dir> <old_commit> <main.tex> <output.tex>
-            _, _, repo_dir, old_commit, main_tex, out_path = sys.argv
-            repo_dir = os.path.abspath(repo_dir)
+            repo_dir = os.path.abspath(os.getcwd())
+
+        # args is now: <old_commit> [<new_commit>] <main.tex> <output.tex>
+        if len(args) == 3:
+            old_commit, main_tex, out_path = args
+            new_commit = None   # compare against working tree
+        elif len(args) == 4:
+            old_commit, new_commit, main_tex, out_path = args
+        else:
+            print('Usage:', file=sys.stderr)
+            print('  latexdiff_better.py --git <old_commit> <main.tex> output.tex', file=sys.stderr)
+            print('  latexdiff_better.py --git <repo_dir> <old_commit> <main.tex> output.tex', file=sys.stderr)
+            print('  latexdiff_better.py --git <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
+            print('  latexdiff_better.py --git <repo_dir> <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
+            sys.exit(1)
 
         main_rel = os.path.relpath(main_tex, repo_dir) if os.path.isabs(main_tex) else main_tex
 
@@ -1781,19 +1829,27 @@ def main():
             sys.exit(1)
         old_text = flatten_from_git(old_main, repo_dir, old_commit)
 
-        new_main_path = os.path.join(repo_dir, main_rel)
-        with open(new_main_path, encoding='utf-8') as f:
-            new_text = flatten_from_disk(f.read(), repo_dir)
+        if new_commit is None:
+            # Compare against working tree
+            new_main_path = os.path.join(repo_dir, main_rel)
+            with open(new_main_path, encoding='utf-8') as f:
+                new_text = flatten_from_disk(f.read(), repo_dir)
+            def new_csv_loader(path):
+                full = os.path.join(repo_dir, path)
+                return open(full, encoding='utf-8').read() if os.path.exists(full) else None
+        else:
+            # Two-commit mode: read new version from git as well
+            new_main = git_show(repo_dir, new_commit, main_rel)
+            if new_main is None:
+                print(f'Error: {main_rel} not found at commit {new_commit}', file=sys.stderr)
+                sys.exit(1)
+            new_text = flatten_from_git(new_main, repo_dir, new_commit)
+            def new_csv_loader(path):
+                return git_show(repo_dir, new_commit, path)
 
-        # Expand CSV-backed table commands into inline xltabular environments
-        # so the diff pipeline can do row/cell-level diffs on them.
         def old_csv_loader(path):
             return git_show(repo_dir, old_commit, path)
-        def new_csv_loader(path):
-            full = os.path.join(repo_dir, path)
-            if os.path.exists(full):
-                return open(full, encoding='utf-8').read()
-            return None
+
         old_text, new_text, csv_expanded = expand_all_csv_commands(
             old_text, new_text, old_csv_loader, new_csv_loader
         )
@@ -1805,6 +1861,8 @@ def main():
         print('  latexdiff_better.py old.tex new.tex output.tex', file=sys.stderr)
         print('  latexdiff_better.py --git <old_commit> <main.tex> output.tex', file=sys.stderr)
         print('  latexdiff_better.py --git <repo_dir> <old_commit> <main.tex> output.tex', file=sys.stderr)
+        print('  latexdiff_better.py --git <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
+        print('  latexdiff_better.py --git <repo_dir> <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -1813,7 +1871,7 @@ def main():
     old_preamble, old_body = split_preamble_body(old_text)
     new_preamble, new_body = split_preamble_body(new_text)
 
-    out_preamble = inject_diff_packages(new_preamble)
+    out_preamble = inject_diff_packages(diff_preamble_tables(old_preamble, new_preamble))
 
     old_segs = segment_text(old_body)
     new_segs = segment_text(new_body)

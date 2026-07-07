@@ -253,6 +253,133 @@ class TestBug3InlineCommentInWordDiff:
 
 
 # ---------------------------------------------------------------------------
+# Bug 4 — deleted pure-comment lines must not produce empty \sout{}
+# ---------------------------------------------------------------------------
+
+class TestBug4EmptySoutOnCommentLines:
+    r"""Bug 4: deleting a line that is purely a LaTeX comment must produce a
+    % DIFF-DEL comment, not \textcolor{BUR}{\sout{}}% ... with an empty \sout{}."""
+
+    def test_deleted_comment_line_no_empty_sout(self):
+        """Deleted pure-comment line must not produce \\sout{}."""
+        old = "% This is an explanatory comment that was removed.\n"
+        new = ""
+        out = run_diff(old, new)
+        assert r'\sout{}' not in out, (
+            r"Deleted comment line must not produce \sout{} (empty strikethrough)"
+        )
+
+    def test_deleted_comment_line_uses_diff_del(self):
+        """Deleted pure-comment line must be recorded as % DIFF-DEL: ..."""
+        old = "% reviewer note: this section needs updating\n"
+        new = ""
+        out = run_diff(old, new)
+        assert '% DIFF-DEL:' in out, "Deleted comment line must appear as % DIFF-DEL: ..."
+
+    def test_deleted_comment_line_preserves_content(self):
+        """The comment content must appear in the output (inside % DIFF-DEL)."""
+        old = "% important note about the algorithm\n"
+        new = "Some new text.\n"
+        out = run_diff(old, new)
+        assert 'important note about the algorithm' in out
+
+    def test_plain_text_deletion_unaffected(self):
+        """Regression: plain (non-comment) deleted lines still use \\sout{}."""
+        old = "This sentence has no comment.\n"
+        new = "Completely different sentence.\n"
+        out = run_diff(old, new)
+        assert r'\sout{' in out
+
+
+# ---------------------------------------------------------------------------
+# Bug 5 — \acfi, \aclu, \acfu must not appear inside \sout{}
+# ---------------------------------------------------------------------------
+
+class TestBug5AcMultiCharSuffixNotInSout:
+    r"""Bug 5: \ac* commands with multi-character suffixes (\acfi, \aclu, \acfu)
+    must be detected by _NOSOUT_RE and never wrapped in \sout{}."""
+
+    def test_acfi_not_in_sout(self):
+        r"""\\acfi{} must use {\color{BUR}...} not \\sout{}."""
+        old = "The \\acfi{ESA} mission started.\n"
+        new = "The mission started.\n"
+        out = run_diff(old, new)
+        assert_no_sout_pattern(out, r'\\acfi\b', r'\acfi must not appear inside \sout{}')
+
+    def test_aclu_not_in_sout(self):
+        r"""\\aclu{} must use {\color{BUR}...} not \\sout{}."""
+        old = "As described by \\aclu{GPP}.\n"
+        new = "As described previously.\n"
+        out = run_diff(old, new)
+        assert_no_sout_pattern(out, r'\\aclu\b', r'\aclu must not appear inside \sout{}')
+
+    def test_acfu_not_in_sout(self):
+        r"""\\acfu{} must use {\color{BUR}...} not \\sout{}."""
+        old = "See \\acfu{SAR} for details.\n"
+        new = "See the technical report for details.\n"
+        out = run_diff(old, new)
+        assert_no_sout_pattern(out, r'\\acfu\b', r'\acfu must not appear inside \sout{}')
+
+    def test_acsf_not_in_sout(self):
+        r"""\\acsf{} (two-char suffix) must use {\color{BUR}...} not \\sout{}."""
+        old = "Defined in \\acsf{EOPF}.\n"
+        new = "Defined in the specification.\n"
+        out = run_diff(old, new)
+        assert_no_sout_pattern(out, r'\\acsf\b', r'\acsf must not appear inside \sout{}')
+
+    def test_acp_still_not_in_sout(self):
+        r"""Regression: single-char suffix \\acp{} must also still not appear in \\sout{}."""
+        old = "All \\acp{SAR} instruments use this.\n"
+        new = "All radar instruments use this.\n"
+        out = run_diff(old, new)
+        assert_no_sout_pattern(out, r'\\acp\b', r'\acp must not appear inside \sout{}')
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 regression — diff_preamble_tables is now wired into main pipeline
+# ---------------------------------------------------------------------------
+
+class TestPreambleDiffVisible:
+    """Preamble table changes must appear in the diff output."""
+
+    def test_preamble_table_change_visible(self):
+        """A table in the preamble that changes must produce diff markup."""
+        preamble_old = (
+            r"\documentclass{article}" + "\n"
+            r"\usepackage{colortbl}" + "\n"
+            r"\newcommand{\mytable}{%" + "\n"
+            r"\begin{tabular}{|l|l|}" + "\n"
+            r"\hline" + "\n"
+            r"A & Old value \\" + "\n"
+            r"\hline" + "\n"
+            r"\end{tabular}}" + "\n"
+            r"\begin{document}" + "\n"
+        )
+        preamble_new = (
+            r"\documentclass{article}" + "\n"
+            r"\usepackage{colortbl}" + "\n"
+            r"\newcommand{\mytable}{%" + "\n"
+            r"\begin{tabular}{|l|l|}" + "\n"
+            r"\hline" + "\n"
+            r"A & New value \\" + "\n"
+            r"\hline" + "\n"
+            r"\end{tabular}}" + "\n"
+            r"\begin{document}" + "\n"
+        )
+        old_p, _ = ldb.split_preamble_body(preamble_old + r"\end{document}")
+        new_p, _ = ldb.split_preamble_body(preamble_new + r"\end{document}")
+        result = ldb.inject_diff_packages(ldb.diff_preamble_tables(old_p, new_p))
+        # The changed cell value must appear with diff markup.
+        # Word-level diff produces \sout{Old} and \textcolor{ao}{New} — check for markup
+        assert 'diffdel' in result or 'sout' in result, (
+            "Preamble table change must produce visible diff markup"
+        )
+        assert 'New' in result and 'Old' in result, (
+            "Both old and new cell values must appear in preamble diff output"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Regression tests — known-good behaviour must not break
 # ---------------------------------------------------------------------------
 
