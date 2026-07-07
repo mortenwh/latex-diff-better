@@ -9,11 +9,19 @@ Bug 2 (Correctness): Added comment-only lines (starting with %) wrapped as
 
 Bug 3 (Correctness): Word-level diff on lines containing inline % comments produces
         mid-line \textcolor{ao}{}% which silences all diff tokens after the % on that line.
+
+Bug 4 (Compilation error): \sout{} wrapping vertical-mode / TOC / page-setup commands
+        (\tableofcontents, \listoffigures, \listoftables, \pagestyle, \thispagestyle,
+        \addcontentsline, \addtocontents) that cannot appear inside ulem's horizontal LR box.
+        Integration tests verify that pdflatex + bibtex succeed on the generated diff.tex.
 """
 
 import re
+import subprocess
 import sys
 import os
+import shutil
+import textwrap
 import pytest
 
 # Allow importing latexdiff_better from parent directory
@@ -858,3 +866,243 @@ class TestBug6BraceAwareSplitting:
         assert ldb._brace_balanced(output), (
             "Full diff output has unbalanced braces for deleted table with \\makecell"
         )
+
+
+# ---------------------------------------------------------------------------
+# Bug 4 — unit tests: TOC / page-setup commands must not appear in \sout{}
+# ---------------------------------------------------------------------------
+
+class TestBug4StructuralCommandsNotInSout:
+    r"""Bug 4: \tableofcontents, \pagestyle, \thispagestyle, \addcontentsline,
+    \listoffigures, \listoftables, \addtocontents must not be wrapped in \sout{}
+    because they involve vertical mode, .toc/.aux file I/O, or PDF state and
+    cannot appear inside ulem's horizontal LR box."""
+
+    def _assert_no_sout_structural(self, cmd_line):
+        """Run a deletion diff and assert the command is NOT inside \\sout{}."""
+        out = run_diff(cmd_line + "\n", "")
+        assert_no_sout_pattern(out, re.escape(cmd_line.split('{')[0].strip()),
+                                f"{cmd_line!r} must not appear inside \\sout{{}}")
+
+    def test_tableofcontents_not_in_sout(self):
+        self._assert_no_sout_structural(r"\tableofcontents")
+
+    def test_listoffigures_not_in_sout(self):
+        self._assert_no_sout_structural(r"\listoffigures")
+
+    def test_listoftables_not_in_sout(self):
+        self._assert_no_sout_structural(r"\listoftables")
+
+    def test_pagestyle_not_in_sout(self):
+        self._assert_no_sout_structural(r"\pagestyle{fancy}")
+
+    def test_thispagestyle_not_in_sout(self):
+        self._assert_no_sout_structural(r"\thispagestyle{fancy}")
+
+    def test_addcontentsline_not_in_sout(self):
+        self._assert_no_sout_structural(r"\addcontentsline{toc}{section}{Acronyms}")
+
+    def test_addtocontents_not_in_sout(self):
+        self._assert_no_sout_structural(r"\addtocontents{toc}{\protect\vspace{1em}}")
+
+
+# ---------------------------------------------------------------------------
+# Bug 4 — integration tests: pdflatex + bibtex must succeed on diff.tex
+# ---------------------------------------------------------------------------
+
+# Minimal LaTeX document that exercises all the problematic structural commands.
+_INTEG_PREAMBLE = textwrap.dedent(r"""
+    \documentclass{article}
+    \usepackage[hidelinks]{hyperref}
+    \usepackage{acronym}
+    \usepackage{fancyhdr}
+    \pagestyle{fancy}
+""").lstrip()
+
+_INTEG_BIB = textwrap.dedent(r"""
+    @article{smith2020,
+      author = {Smith, J.},
+      title  = {A Title},
+      journal = {Some Journal},
+      year   = {2020},
+    }
+""").lstrip()
+
+_INTEG_OLD_BODY = textwrap.dedent(r"""
+    \begin{document}
+    \pagestyle{fancy}
+    \tableofcontents
+    \thispagestyle{fancy}
+    \addcontentsline{toc}{section}{Acronyms}
+    \section{Introduction}
+    This was the old introduction \cite{smith2020}.
+    It had extra content that will be removed.
+    \bibliographystyle{plain}
+    \bibliography{refs}
+    \end{document}
+""").lstrip()
+
+_INTEG_NEW_BODY = textwrap.dedent(r"""
+    \begin{document}
+    \section{Introduction}
+    This is the new introduction \cite{smith2020}.
+    \bibliographystyle{plain}
+    \bibliography{refs}
+    \end{document}
+""").lstrip()
+
+
+def _run(cmd, cwd):
+    """Run a subprocess; return (returncode, combined stdout+stderr)."""
+    result = subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def _git(args, cwd):
+    rc, out = _run(["git"] + args, cwd)
+    assert rc == 0, f"git {args} failed:\n{out}"
+    return out
+
+
+@pytest.mark.integration
+class TestIntegrationCompile:
+    """Integration tests: generate diff.tex with --git and verify pdflatex compiles it."""
+
+    SCRIPT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "latexdiff_better.py",
+    )
+
+    @pytest.fixture()
+    def repo(self, tmp_path):
+        """Set up a minimal git repo with old version committed and new version on disk."""
+        _git(["init", "-b", "main"], tmp_path)
+        _git(["config", "user.email", "test@example.com"], tmp_path)
+        _git(["config", "user.name", "Test"], tmp_path)
+
+        main_tex = tmp_path / "main.tex"
+        bib = tmp_path / "refs.bib"
+
+        # Write and commit the OLD version
+        main_tex.write_text(_INTEG_PREAMBLE + _INTEG_OLD_BODY)
+        bib.write_text(_INTEG_BIB)
+        _git(["add", "."], tmp_path)
+        _git(["commit", "-m", "old version"], tmp_path)
+        old_commit = _git(["rev-parse", "HEAD"], tmp_path).strip()
+
+        # Write the NEW version (working tree, not committed)
+        main_tex.write_text(_INTEG_PREAMBLE + _INTEG_NEW_BODY)
+
+        return tmp_path, old_commit
+
+    def test_diff_tex_generates(self, repo):
+        """latexdiff_better.py --git produces diff.tex without errors."""
+        tmp_path, old_commit = repo
+        rc, out = _run(
+            [sys.executable, self.SCRIPT, "--git", old_commit, "main.tex", "diff.tex"],
+            cwd=tmp_path,
+        )
+        assert rc == 0, f"Script failed:\n{out}"
+        assert (tmp_path / "diff.tex").exists(), "diff.tex was not created"
+
+    def test_no_structural_command_in_sout(self, repo):
+        """Generated diff.tex must not contain structural commands inside \\sout{}."""
+        tmp_path, old_commit = repo
+        _run(
+            [sys.executable, self.SCRIPT, "--git", old_commit, "main.tex", "diff.tex"],
+            cwd=tmp_path,
+        )
+        diff_tex = (tmp_path / "diff.tex").read_text()
+        for cmd in (r"\tableofcontents", r"\pagestyle", r"\thispagestyle",
+                    r"\addcontentsline", r"\addtocontents",
+                    r"\listoffigures", r"\listoftables"):
+            assert_no_sout_pattern(
+                diff_tex, re.escape(cmd),
+                f"{cmd} must not appear inside \\sout{{}} in diff.tex",
+            )
+
+    @pytest.mark.skipif(
+        shutil.which("pdflatex") is None,
+        reason="pdflatex not available",
+    )
+    def test_pdflatex_compiles(self, repo):
+        """pdflatex must compile diff.tex to a PDF without fatal errors."""
+        tmp_path, old_commit = repo
+        _run(
+            [sys.executable, self.SCRIPT, "--git", old_commit, "main.tex", "diff.tex"],
+            cwd=tmp_path,
+        )
+        rc, out = _run(
+            ["pdflatex", "-interaction=nonstopmode", "diff.tex"],
+            cwd=tmp_path,
+        )
+        assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
+        assert (tmp_path / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"
+
+    @pytest.mark.skipif(
+        shutil.which("pdflatex") is None or shutil.which("bibtex") is None,
+        reason="pdflatex or bibtex not available",
+    )
+    def test_bibtex_and_pdflatex_compile(self, repo):
+        """Full build: pdflatex -> bibtex -> pdflatex -> pdflatex must all succeed."""
+        tmp_path, old_commit = repo
+        _run(
+            [sys.executable, self.SCRIPT, "--git", old_commit, "main.tex", "diff.tex"],
+            cwd=tmp_path,
+        )
+        # First pass — generate .aux
+        _run(["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=tmp_path)
+        # bibtex pass
+        rc, out = _run(["bibtex", "diff"], cwd=tmp_path)
+        assert rc == 0, f"bibtex failed:\n{out}"
+        # Second and third pdflatex passes
+        for _ in range(2):
+            rc, out = _run(
+                ["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=tmp_path
+            )
+            assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
+        assert (tmp_path / "diff.pdf").exists(), "diff.pdf not produced after full build"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.path.isdir("/home/mortenwh/esa-ross-TN2"),
+    reason="esa-ross-TN2 repo not present",
+)
+@pytest.mark.skipif(
+    shutil.which("pdflatex") is None,
+    reason="pdflatex not available",
+)
+class TestIntegrationEsaRossTN2:
+    """Repo-level integration test using the real esa-ross-TN2 document."""
+
+    SCRIPT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "latexdiff_better.py",
+    )
+    REPO = "/home/mortenwh/esa-ross-TN2"
+    OLD_COMMIT = "7d395b76b7b5dd80f6c9889ba057468fbff5b0c4"
+
+    def test_pdflatex_compiles(self, tmp_path):
+        """esa-ross-TN2: diff against known commit must compile to PDF."""
+        # Copy repo to tmp so we don't pollute the original
+        dest = tmp_path / "repo"
+        shutil.copytree(self.REPO, dest, symlinks=True)
+
+        rc, out = _run(
+            [sys.executable, self.SCRIPT, "--git", self.OLD_COMMIT, "main.tex", "diff.tex"],
+            cwd=dest,
+        )
+        assert rc == 0, f"Script failed:\n{out}"
+
+        # Clean stale aux files before compiling
+        for ext in ("aux", "bbl", "blg", "toc", "out"):
+            (dest / f"diff.{ext}").unlink(missing_ok=True)
+
+        rc, out = _run(
+            ["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest
+        )
+        assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
+        assert (dest / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"

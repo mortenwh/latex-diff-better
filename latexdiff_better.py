@@ -114,7 +114,12 @@ _STRUCTURAL_RE = re.compile(
     r'\\(section\*?|subsection\*?|subsubsection\*?|paragraph\*?|chapter\*?'
     r'|begin|end|newpage|clearpage|appendix'
     r'|newcommand|renewcommand|providecommand'
-    r'|setcounter|addtocounter|def)\b'
+    r'|setcounter|addtocounter|def'
+    # TOC / page-setup commands — involve vertical mode, .toc/.aux I/O, or PDF
+    # state management; ulem's \sout{} (horizontal LR box) cannot contain them.
+    r'|tableofcontents|listoffigures|listoftables'
+    r'|pagestyle|thispagestyle'
+    r'|addcontentsline|addtocontents)\b'
 )
 
 # Matches a section-type command with its title argument, e.g. \subsection{4.7 ROSS}
