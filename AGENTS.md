@@ -8,9 +8,7 @@ The project is about highlighting the differences between two versions of the sa
 
 * Enter /plan mode to plan the work first
 * Check if `latexdiff_better.py` can be used to find the differences between
-  the v0.2 and v1.0 tags of `/home/mortenwh/esa-rl2ocean-production-model`
-* I suspect that we can only use hash codes of the versions and, if this is the
-  case, we need to accomodate the code.
+  the v0.1 and v1.0 tags of `/home/mortenwh/esa-rl2ocean-spamr`
 
 ## Session startup
 
