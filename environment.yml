@@ -1,0 +1,15 @@
+name: latexdiff-better
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11.16
+  - pytest=9.1.1
+  - loguru=0.7.3
+  - tqdm=4.70.1
+  - codespell=2.4.3
+  - ruff=0.16.9
+  - pylint=4.0.10
+  - flake8=7.4.1
+  - complexipy=8.0.1
+  - mypy=2.3.1

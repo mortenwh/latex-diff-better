@@ -11,6 +11,18 @@ Created with the help of GitHub Copilot and Claude Sonnet 4.6. High risk of
 failure but might be gradually improved.
 
 
+# SETUP
+
+Create the mamba environment (conda-forge only, pinned versions) if it does not
+already exist:
+
+    mamba env create -f environment.yml
+    mamba activate latexdiff-better
+
+See `DOCUMENTATION.md` for full technical details, including the TeX Live setup
+required for the integration tests.
+
+
 # HOW TO READ THE gitdiff.tex OUTPUT
 
 ## COLOUR CODING QUICK REFERENCE
@@ -127,3 +139,11 @@ Two-file mode (simple):
 
 Git mode (multi-file document with CSV tables):
     python3 latexdiff_better.py --git <old_commit> <main.tex> output.tex
+
+Git mode with a renamed main file (e.g. across tags where the main file changed name):
+    python3 latexdiff_better.py --git <old_commit> <new_commit> <main.tex> output.tex \
+        --old-main <old_commit_main.tex>
+
+Git mode with a renamed main file (e.g. across tags where the main file changed name):
+    python3 latexdiff_better.py --git <old_commit> <new_commit> <main.tex> output.tex \
+        --old-main <old_commit_main.tex>

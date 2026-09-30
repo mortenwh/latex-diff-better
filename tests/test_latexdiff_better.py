@@ -869,6 +869,41 @@ class TestBug6BraceAwareSplitting:
 
 
 # ---------------------------------------------------------------------------
+# Bug 7 — diff_cells_inline must use a brace-aware tokenizer
+# ---------------------------------------------------------------------------
+
+class TestBug7CellInlineBraceAwareTokenizer:
+    r"""Bug 7 (compilation error): diff_cells_inline previously tokenized table
+    cell text with a naive `\S+|\s+` regex, which splits inside `\cmd{...}`
+    groups (e.g. `\textbf{SLC` and `Spacing}` become separate tokens). When the
+    word-level diff then replaced only the inner word, it wrapped these
+    fragments in `{\color{...}...}`, producing unbalanced braces and a fatal
+    pdflatex "Runaway argument" / emergency stop.
+
+    Fix: diff_cells_inline now tokenizes with the brace-aware `_latex_tokenize`
+    (already used by diff_words_in_line), which keeps each `\cmd{...}` group as
+    a single atomic token.
+    """
+
+    def test_nested_command_replaced_by_command_stays_balanced(self):
+        r"""Replacing a plain word with a command inside \textbf{} must stay balanced."""
+        old_c = r"\textbf{SLC Pixel Spacing} (Az $\times$ Rg)"
+        new_c = r"\textbf{\ac{SLC} Pixel Spacing} (Az $\times$ Rg)"
+        result = ldb.diff_cells_inline(old_c, new_c)
+        assert ldb._brace_balanced(result), (
+            f"diff_cells_inline produced unbalanced braces: {result!r}"
+        )
+
+    def test_nested_command_replaced_by_command_content_preserved(self):
+        r"""Both the deleted \textbf{...} and added \textbf{\ac{...}...} must be present."""
+        old_c = r"\textbf{SLC Pixel Spacing} (Az $\times$ Rg)"
+        new_c = r"\textbf{\ac{SLC} Pixel Spacing} (Az $\times$ Rg)"
+        result = ldb.diff_cells_inline(old_c, new_c)
+        assert r'\textbf{SLC Pixel Spacing}' in result
+        assert r'\textbf{\ac{SLC} Pixel Spacing}' in result
+
+
+# ---------------------------------------------------------------------------
 # Bug 4 — unit tests: TOC / page-setup commands must not appear in \sout{}
 # ---------------------------------------------------------------------------
 
@@ -1066,6 +1101,58 @@ class TestIntegrationCompile:
         assert (tmp_path / "diff.pdf").exists(), "diff.pdf not produced after full build"
 
 
+class TestOldMainFlag:
+    """Unit-level test for --git's --old-main override (renamed main file)."""
+
+    SCRIPT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "latexdiff_better.py",
+    )
+
+    @pytest.fixture()
+    def renamed_repo(self, tmp_path):
+        """Old commit has old_main.tex; working tree has it renamed to main.tex."""
+        _git(["init", "-b", "main"], tmp_path)
+        _git(["config", "user.email", "test@example.com"], tmp_path)
+        _git(["config", "user.name", "Test"], tmp_path)
+
+        old_main = tmp_path / "old_main.tex"
+        old_main.write_text(_INTEG_PREAMBLE + _INTEG_OLD_BODY)
+        _git(["add", "."], tmp_path)
+        _git(["commit", "-m", "old version, old filename"], tmp_path)
+        old_commit = _git(["rev-parse", "HEAD"], tmp_path).strip()
+
+        old_main.unlink()
+        (tmp_path / "main.tex").write_text(_INTEG_PREAMBLE + _INTEG_NEW_BODY)
+
+        return tmp_path, old_commit
+
+    def test_old_main_flag_finds_renamed_file(self, renamed_repo):
+        """--old-main old_main.tex must let --git diff against a renamed main file."""
+        tmp_path, old_commit = renamed_repo
+        rc, out = _run(
+            [
+                sys.executable, self.SCRIPT, "--git", old_commit, "main.tex",
+                "--old-main", "old_main.tex", "diff.tex",
+            ],
+            cwd=tmp_path,
+        )
+        assert rc == 0, f"Script failed:\n{out}"
+        diff_tex = (tmp_path / "diff.tex").read_text()
+        assert r'\textcolor{ao}{new}' in diff_tex
+        assert r'\sout{old}' in diff_tex
+
+    def test_missing_old_main_path_errors_clearly(self, renamed_repo):
+        """Without --old-main, looking up the new filename at old_commit must fail cleanly."""
+        tmp_path, old_commit = renamed_repo
+        rc, out = _run(
+            [sys.executable, self.SCRIPT, "--git", old_commit, "main.tex", "diff.tex"],
+            cwd=tmp_path,
+        )
+        assert rc == 1
+        assert "not found at commit" in out
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     not os.path.isdir("/home/mortenwh/esa-ross-TN2"),
@@ -1106,3 +1193,56 @@ class TestIntegrationEsaRossTN2:
         )
         assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
         assert (dest / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.path.isdir("/home/mortenwh/esa-rl2ocean-production-model"),
+    reason="esa-rl2ocean-production-model repo not present",
+)
+@pytest.mark.skipif(
+    shutil.which("pdflatex") is None or shutil.which("bibtex") is None,
+    reason="pdflatex or bibtex not available",
+)
+class TestIntegrationRl2oceanOldMainRename:
+    """Repo-level integration test: --old-main across a main-file rename.
+
+    Between tags v0.2 and v1.0 of esa-rl2ocean-production-model, the main file
+    was renamed from production_model.tex to main.tex.  --git's two-commit mode
+    otherwise assumes the same path in both commits, so --old-main is required.
+    """
+
+    SCRIPT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "latexdiff_better.py",
+    )
+    REPO = "/home/mortenwh/esa-rl2ocean-production-model"
+
+    def test_old_main_rename_compiles(self, tmp_path):
+        """v0.2 (production_model.tex) -> v1.0 (main.tex) diff must compile to PDF."""
+        dest = tmp_path / "repo"
+        shutil.copytree(self.REPO, dest, symlinks=True)
+
+        rc, out = _run(
+            [
+                sys.executable, self.SCRIPT, "--git", "v0.2", "v1.0", "main.tex",
+                "--old-main", "production_model.tex", "diff.tex",
+            ],
+            cwd=dest,
+        )
+        assert rc == 0, f"Script failed:\n{out}"
+        assert (dest / "diff.tex").exists(), "diff.tex was not created"
+
+        for ext in ("aux", "bbl", "blg", "toc", "out"):
+            (dest / f"diff.{ext}").unlink(missing_ok=True)
+
+        _run(["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest)
+        rc, out = _run(["bibtex", "diff"], cwd=dest)
+        assert rc == 0, f"bibtex failed:\n{out}"
+        for _ in range(2):
+            rc, out = _run(
+                ["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest
+            )
+            assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
+        assert (dest / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"
+

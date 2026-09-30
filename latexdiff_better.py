@@ -798,8 +798,8 @@ def diff_cells_inline(old_c, new_c):
         result = diff_cells_inline(old_inner, new_inner)
         return '{' + result + '}'
 
-    old_toks = re.findall(r'\S+|\s+', old_c)
-    new_toks = re.findall(r'\S+|\s+', new_c)
+    old_toks = _latex_tokenize(old_c)
+    new_toks = _latex_tokenize(new_c)
     out = []
     sm = difflib.SequenceMatcher(None, old_toks, new_toks, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -1956,6 +1956,57 @@ def inject_diff_packages(preamble):
 # Main
 # ---------------------------------------------------------------------------
 
+def _parse_git_mode_args(argv_tail):
+    """Parse the argument list following ``--git`` and return parsed fields.
+
+    Handles the optional leading ``<repo_dir>``, the optional trailing
+    ``--old-main <path>`` flag, and the ``<old_commit> [<new_commit>]
+    <main.tex> <output.tex>`` positional forms. Prints a usage message and
+    exits with status 1 on any parsing error.
+
+    Args:
+        argv_tail: ``sys.argv[2:]`` — everything after ``--git``.
+
+    Returns:
+        Tuple of (repo_dir, old_commit, new_commit, main_tex, out_path,
+        old_main_override). ``new_commit``/``old_main_override`` are ``None``
+        when not given.
+    """
+    args = list(argv_tail)
+
+    old_main_override = None
+    if '--old-main' in args:
+        idx = args.index('--old-main')
+        if idx + 1 >= len(args):
+            print('Error: --old-main requires a path argument', file=sys.stderr)
+            sys.exit(1)
+        old_main_override = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    if args and os.path.isdir(args[0]):
+        repo_dir = os.path.abspath(args[0])
+        args = args[1:]
+    else:
+        repo_dir = os.path.abspath(os.getcwd())
+
+    # args is now: <old_commit> [<new_commit>] <main.tex> <output.tex>
+    if len(args) == 3:
+        old_commit, main_tex, out_path = args
+        new_commit = None   # compare against working tree
+    elif len(args) == 4:
+        old_commit, new_commit, main_tex, out_path = args
+    else:
+        print('Usage:', file=sys.stderr)
+        print('  latexdiff_better.py --git <old_commit> <main.tex> output.tex', file=sys.stderr)
+        print('  latexdiff_better.py --git <repo_dir> <old_commit> <main.tex> output.tex', file=sys.stderr)
+        print('  latexdiff_better.py --git <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
+        print('  latexdiff_better.py --git <repo_dir> <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
+        print('  (any form above may add: --old-main <old_commit_main.tex>)', file=sys.stderr)
+        sys.exit(1)
+
+    return repo_dir, old_commit, new_commit, main_tex, out_path, old_main_override
+
+
 def main():
     """Entry point: parse arguments and run the diff pipeline.
 
@@ -1965,9 +2016,14 @@ def main():
         expands CSV table commands, and diffs them directly.
 
       Git mode:  --git [<repo_dir>] <old_commit> [<new_commit>] <main.tex> output.tex
+                       [--old-main <path>]
         If <repo_dir> is omitted the current working directory is used as the repo.
         If <new_commit> is omitted the working tree is used as the new version.
-        1. Reads main.tex and all its \\include'd sub-files at old_commit from git.
+        If <main.tex> was renamed between old_commit and new_commit, pass the
+        old commit's path via --old-main <path> (main.tex/output.tex still refer
+        to the new/working-tree side).
+        1. Reads main.tex (or --old-main's path) and all its \\include'd sub-files
+           at old_commit from git.
         2. Reads the new version either from the working tree (default) or from
            <new_commit> in git (two-commit mode).
         3. Expands \\csvlongtable / \\csvlongtbd / \\csvlongtrace in both versions.
@@ -2006,42 +2062,26 @@ def main():
         if csv_expanded:
             print('CSV tables expanded for diffing')
 
-    elif sys.argv[1] == '--git' and len(sys.argv) in (5, 6, 7):
-        # Git mode argument parsing.  The optional <repo_dir> is distinguished from
-        # a commit hash by checking whether the first positional argument is a directory.
-        #
-        # Supported forms:
-        #   --git <old_commit> <main.tex> <output.tex>              (repo = cwd)
-        #   --git <repo_dir> <old_commit> <main.tex> <output.tex>
-        #   --git <old_commit> <new_commit> <main.tex> <output.tex> (repo = cwd)
-        #   --git <repo_dir> <old_commit> <new_commit> <main.tex> <output.tex>
-        args = sys.argv[2:]  # everything after --git
-        if os.path.isdir(args[0]):
-            repo_dir = os.path.abspath(args[0])
-            args = args[1:]
-        else:
-            repo_dir = os.path.abspath(os.getcwd())
-
-        # args is now: <old_commit> [<new_commit>] <main.tex> <output.tex>
-        if len(args) == 3:
-            old_commit, main_tex, out_path = args
-            new_commit = None   # compare against working tree
-        elif len(args) == 4:
-            old_commit, new_commit, main_tex, out_path = args
-        else:
-            print('Usage:', file=sys.stderr)
-            print('  latexdiff_better.py --git <old_commit> <main.tex> output.tex', file=sys.stderr)
-            print('  latexdiff_better.py --git <repo_dir> <old_commit> <main.tex> output.tex', file=sys.stderr)
-            print('  latexdiff_better.py --git <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
-            print('  latexdiff_better.py --git <repo_dir> <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
-            sys.exit(1)
+    elif len(sys.argv) >= 2 and sys.argv[1] == '--git':
+        # Git mode: --git [<repo_dir>] <old_commit> [<new_commit>] <main.tex> output.tex
+        #   [--old-main <path>]
+        # See _parse_git_mode_args for the full set of supported forms.
+        (repo_dir, old_commit, new_commit, main_tex, out_path,
+         old_main_override) = _parse_git_mode_args(sys.argv[2:])
 
         main_rel = os.path.relpath(main_tex, repo_dir) if os.path.isabs(main_tex) else main_tex
+        if old_main_override is not None:
+            old_main_rel = (
+                os.path.relpath(old_main_override, repo_dir)
+                if os.path.isabs(old_main_override) else old_main_override
+            )
+        else:
+            old_main_rel = main_rel
         old_label = old_commit
 
-        old_main = git_show(repo_dir, old_commit, main_rel)
+        old_main = git_show(repo_dir, old_commit, old_main_rel)
         if old_main is None:
-            print(f'Error: {main_rel} not found at commit {old_commit}', file=sys.stderr)
+            print(f'Error: {old_main_rel} not found at commit {old_commit}', file=sys.stderr)
             sys.exit(1)
         old_text = flatten_from_git(old_main, repo_dir, old_commit)
 
@@ -2081,6 +2121,7 @@ def main():
         print('  latexdiff_better.py --git <repo_dir> <old_commit> <main.tex> output.tex', file=sys.stderr)
         print('  latexdiff_better.py --git <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
         print('  latexdiff_better.py --git <repo_dir> <old_commit> <new_commit> <main.tex> output.tex', file=sys.stderr)
+        print('  (any --git form above may add: --old-main <old_commit_main.tex>)', file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
