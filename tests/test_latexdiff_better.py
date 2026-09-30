@@ -47,6 +47,7 @@ def make_doc(body):
 
 def run_diff(old_body, new_body):
     """Run the full diff pipeline on two document bodies and return the output text."""
+    ldb.reset_deleted_label_registry()
     old_text = make_doc(old_body)
     new_text = make_doc(new_body)
     old_preamble, old_b = ldb.split_preamble_body(old_text)
@@ -901,6 +902,59 @@ class TestBug7CellInlineBraceAwareTokenizer:
         result = ldb.diff_cells_inline(old_c, new_c)
         assert r'\textbf{SLC Pixel Spacing}' in result
         assert r'\textbf{\ac{SLC} Pixel Spacing}' in result
+
+
+# ---------------------------------------------------------------------------
+# Bug 8 — deleted \label{...} must be renamed to avoid "multiply defined"
+# ---------------------------------------------------------------------------
+
+class TestBug8DeletedLabelRenamed:
+    r"""Bug 8 (correctness): when a whole section is rewritten heavily enough
+    that the diff engine renders it as delete-old-section + add-new-section,
+    and both versions keep the same \label{...}, both \label commands used to
+    execute (since \sout{}/{\color{}} markup doesn't suppress a wrapped
+    command's side effect), causing a LaTeX "Label ... multiply defined"
+    warning and making \ref resolution depend on document order.
+
+    Fix: del_markup() now renames any \label{X} found in deleted text to
+    \label{X_old} (or _old2, _old3, ... if the same name is deleted more than
+    once), so exactly one live \label{X} remains in the output.
+    """
+
+    def setup_method(self):
+        ldb.reset_deleted_label_registry()
+
+    def test_del_markup_renames_label(self):
+        r"""del_markup() must rename \label{X} to \label{X_old}."""
+        result = ldb.del_markup(r'\label{sec:foo}')
+        assert r'\label{sec:foo_old}' in result
+        assert r'\label{sec:foo}' not in result
+
+    def test_del_markup_renames_repeated_label_uniquely(self):
+        r"""Deleting the same label name twice must not collide: _old, then _old2."""
+        first = ldb.del_markup(r'\label{sec:foo}')
+        second = ldb.del_markup(r'\label{sec:foo}')
+        assert r'\label{sec:foo_old}' in first
+        assert r'\label{sec:foo_old2}' in second
+
+    def test_rewritten_section_keeps_single_live_label(self):
+        r"""diff_segments() renders an entirely unmatched old/new text segment
+        pair as an independent full delete (diff_text_block(old, '')) followed
+        by an independent full insert (diff_text_block('', new)) — with no
+        line-pairing between them (see the ``ot == 'text' and nt == 'text'``
+        float-guard branch, and the type-mismatch/extra-segment branches, in
+        diff_segments()). If both segments happen to keep the same \label
+        (typical when a section is rewritten but its anchor is not), that
+        label must appear exactly once live in the output."""
+        old = "\\section{Old Title}\n\\label{sec:x}\nCompletely unrelated old prose.\n"
+        new = "\\section{New Title}\n\\label{sec:x}\nEntirely different new prose.\n"
+        del_part = ldb.diff_text_block(old, '')
+        add_part = ldb.diff_text_block('', new)
+        out = del_part + add_part
+        assert out.count(r'\label{sec:x}') == 1, (
+            f"Expected exactly one live \\label{{sec:x}}, got output:\n{out}"
+        )
+        assert r'\label{sec:x_old}' in out
 
 
 # ---------------------------------------------------------------------------

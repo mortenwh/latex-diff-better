@@ -230,6 +230,43 @@ def add_markup(text):
     return r'\textcolor{ao}{' + text + '}'
 
 
+_LABEL_RE = re.compile(r'\\label\{([^{}]*)\}')
+
+# Tracks how many times each original label name has already been renamed by
+# _suffix_deleted_labels() during the current diff run, so repeated deletions
+# of the same label name get distinct suffixes (_old, _old2, _old3, ...)
+# instead of colliding with each other. Reset once per run by
+# reset_deleted_label_registry() (called from main()).
+_deleted_label_counts: dict = {}
+
+
+def reset_deleted_label_registry():
+    """Clear the deleted-label rename registry. Call once at the start of a diff run."""
+    _deleted_label_counts.clear()
+
+
+def _suffix_deleted_labels(text):
+    """Rename \\label{X} to \\label{X_old} (or _old2, _old3, ... if needed) in deleted text.
+
+    A whole section that is rewritten heavily enough to be rendered as a fully
+    deleted old section plus a fully added new section may keep the same
+    \\label{...} in both versions. Since \\sout{}/{\\color{}} markup does not
+    suppress a wrapped \\label's side effect, leaving both copies live causes a
+    "Label ... multiply defined" LaTeX warning, and which definition wins for
+    \\ref resolution then depends on document order rather than being well
+    defined. Renaming the deleted copy's label keeps the surviving (added or
+    unchanged) definition unambiguous, and the renamed deleted copy becomes an
+    inert label that nothing references.
+    """
+    def _rename(m):
+        name = m.group(1)
+        count = _deleted_label_counts.get(name, 0) + 1
+        _deleted_label_counts[name] = count
+        suffix = '_old' if count == 1 else f'_old{count}'
+        return r'\label{' + name + suffix + '}'
+    return _LABEL_RE.sub(_rename, text)
+
+
 def del_markup(text):
     """Wrap text in red delete markup.
 
@@ -238,9 +275,14 @@ def del_markup(text):
     colour only, no strikethrough) when the text contains structural commands
     or macros with arguments that ulem's \\sout cannot handle safely.
 
+    Any \\label{...} found in the text is renamed (see _suffix_deleted_labels)
+    so a deleted label never collides with a same-named label surviving
+    elsewhere in the diffed document.
+
     Trailing LaTeX % comments are moved outside the closing brace so they are
     not accidentally swallowed into the comment.
     """
+    text = _suffix_deleted_labels(text)
     m = re.search(r'(?<!\\)%', text)
     comment_suffix = ''
     if m:
@@ -2127,6 +2169,7 @@ def main():
     # ------------------------------------------------------------------
     # Diff pipeline (shared by both modes)
     # ------------------------------------------------------------------
+    reset_deleted_label_registry()
     old_preamble, old_body = split_preamble_body(old_text)
     new_preamble, new_body = split_preamble_body(new_text)
 

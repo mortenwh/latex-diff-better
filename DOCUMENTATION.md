@@ -56,6 +56,21 @@ fresh machine and integration tests fail with `\normalem` / `\sout` undefined-co
 sequence errors, repeat the steps above (or install `texlive-latex-extra` via apt if
 `sudo` is available and it happens to include `ulem.sty` on that system).
 
+The same system TeX Live install was also missing `soul.sty` (needed by some source
+documents' own preamble, e.g. via the `doclicense` package — unrelated to this tool's
+own markup). `soul` is now distributed only as `.dtx`/`.ins` source under
+`macros/generic/soul` on CTAN (not a prebuilt `.zip` under `macros/latex/contrib/soul`
+as older instructions might suggest), so it must be extracted with `tex`:
+
+```bash
+curl -sL https://mirrors.ctan.org/macros/generic/soul.zip -o /tmp/soul.zip
+unzip -o /tmp/soul.zip -d /tmp/soul_pkg
+cd /tmp/soul_pkg/soul && tex soul.ins   # generates soul.sty, soul-ori.sty, soulutf8.sty
+mkdir -p ~/texmf/tex/latex/soul
+cp soul.sty soul-ori.sty soulutf8.sty ~/texmf/tex/latex/soul/
+mktexlsr ~/texmf
+```
+
 ## Running tests
 
 ```bash
@@ -63,7 +78,7 @@ mamba activate latexdiff-better
 pytest -q
 ```
 
-As of the last verified run: 75 passed, 1 skipped (skip reason: an optional dependency
+As of the last verified run: 83 passed, 1 skipped (skip reason: an optional dependency
 of one test is unavailable — see test file for details), 0 failed.
 
 Tests are marked `integration` (see `pytest.ini`) when they invoke `pdflatex`/`bibtex`
@@ -77,7 +92,10 @@ grouping, in file order:
 
 - **Markup helpers**: `add_markup`, `del_markup`, `is_structural` — wrap text in
   add/delete highlighting, detect structural LaTeX commands that must not be
-  colored/struck.
+  colored/struck. `del_markup` also renames any `\label{...}` inside deleted text via
+  `_suffix_deleted_labels` (registry reset per run by `reset_deleted_label_registry`,
+  called from `main()`) to avoid "Label multiply defined" clashes with a surviving
+  same-named label.
 - **Brace/tag parsing**: `match_brace_group`, `parse_begin_tag`, `parse_end_tag`,
   `_pos_in_comment` — brace-aware and comment-aware parsing primitives used throughout.
 - **Table detection & row/cell splitting**: `find_table_spans`, `segment_text`,
@@ -156,4 +174,48 @@ Example invocation used to reproduce/verify:
 python3 latexdiff_better.py --git /home/mortenwh/esa-rl2ocean-production-model \
     v0.2 v1.0 main.tex --old-main production_model.tex /tmp/diff.tex
 ```
+
+## Investigation: v0.1 → v1.0 diff of esa-rl2ocean-spamr
+
+Verified (2026-09-30) that `latexdiff_better.py --git` correctly diffs the `v0.1` →
+`v1.0` tags of the sibling `esa-rl2ocean-spamr` repository. This document has no CSV
+tables (unlike the production-model repo) and no code changes were needed — the
+existing `--old-main` flag (added during the production-model investigation) already
+covers this repo's main-file rename.
+
+Findings:
+
+1. **Main file renamed here too**: `rl2ocean_spamr.tex` (v0.1) → `main.tex` (v1.0).
+   Handled with the existing `--old-main rl2ocean_spamr.tex` flag; no code change
+   needed.
+2. **Missing `soul.sty` on this machine's TeX Live** (see "Environment setup" above
+   for the fix) — unrelated to `latexdiff_better.py` itself; it is a dependency of the
+   source document's own preamble (via `doclicense`), not of the diff markup this tool
+   generates.
+3. **Bug found and fixed while testing**: when a whole section was rewritten heavily
+   enough that the diff engine rendered it as a fully deleted old section plus a fully
+   added new section (rather than a unified prose diff), and both versions kept the
+   same `\label{...}`, both `\label` commands executed — `\sout{}`/`\textcolor{}`
+   markup doesn't suppress a wrapped command's side effect — causing a LaTeX "Label
+   ... multiply defined" warning and making `\ref` resolution depend on document
+   order. Fixed by having `del_markup()` rename any `\label{X}` found in deleted text
+   to `\label{X_old}` (or `_old2`, `_old3`, ... if the same name is deleted more than
+   once in one run — tracked via a small module-level registry reset once per diff
+   run by `reset_deleted_label_registry()`). The surviving (added/unchanged)
+   definition keeps its original name, so every `\ref` in the document resolves to it
+   unambiguously; the renamed deleted copy becomes an inert, uniquely-named label that
+   nothing references. Regression tests: `TestBug8DeletedLabelRenamed` in
+   `tests/test_latexdiff_better.py`.
+
+Example invocation used to reproduce/verify:
+
+```bash
+python3 latexdiff_better.py --git /home/mortenwh/esa-rl2ocean-spamr \
+    v0.1 v1.0 main.tex --old-main rl2ocean_spamr.tex /tmp/spamr_diff.tex
+```
+
+Compiled cleanly (`pdflatex` ×3, `bibtex` — no citations in this doc so bibtex found
+nothing to do, which is expected) to a 26-page PDF with zero errors and zero warnings
+(after the `\label` rename fix above; before it, this document is exactly what
+surfaced the three "Label ... multiply defined" warnings).
 
