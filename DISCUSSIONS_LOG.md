@@ -97,3 +97,35 @@ name is deleted more than once) when asked to confirm via `ask_user`.
 - Updated `DOCUMENTATION.md`, `AI_REASONING.md`, `INVESTIGATION.md`.
 **Outcome:** Duplicate-label finding fixed and verified end-to-end on the real
 document; no known open issues remain from either investigation.
+
+## 2026-09-30 — esa-rl2ocean-srs investigation (v0.2 → v1.0), Bugs 9 & 10
+**Prompt:** "See AGENTS.md" — continuing the documented goal of testing
+`latexdiff_better.py` against the `esa-rl2ocean-srs` sibling repo (AGENTS.md said
+"v0.1"/"v1.0"; the repo only has "v0.2"/"v1.0", and had untracked files from a
+concurrent process). Asked the user via `ask_user`; user said use `v0.2`/`v1.0` and
+ignore the concurrent files.
+**Actions:**
+- Ran `latexdiff_better.py --git` on esa-rl2ocean-srs v0.2→v1.0 (main file renamed
+  `rl2ocean_srs.tex`→`main.tex`, same as prior investigations; output written only to
+  `/tmp`, never into the sibling repo).
+- Found and fixed Bug 9: `diff_preamble_tables()` paired preamble tables purely by
+  position; an inserted macro in v1.0 shifted the pairing, corrupting a
+  `\csvlongtable` macro body (fatal "Runaway argument" pdflatex error). Asked the user
+  (via `ask_user`) whether to fix with name-based pairing, a structural-compatibility
+  safety check, or both — user said "both". Implemented both.
+- Found and fixed Bug 10: deleted `\appendix` (entire appendix section removed in
+  v1.0) still executed via `{\color{BUR}\appendix}`, and this document's
+  `\usepackage{appendix}`+`fncychap` on `article` class fails outright
+  (`No counter 'chapter' defined`) whenever `\appendix` executes. Verified with a
+  minimal standalone reproduction. Fixed by adding `\appendix` to `_COMMENT_DEL_RE`
+  (same pattern as `\section`/`\chapter`/`\begin`/`\end`).
+- Regenerated the real diff and compiled (`pdflatex` ×3 + `bibtex`): 67-page PDF, zero
+  fatal errors; remaining warnings are expected/cosmetic (dangling refs into the
+  deleted appendix, unrelated PDF/font noise).
+- Added 4 new regression tests (2 unit for Bug 9, 1 unit for Bug 10, 1 real-repo
+  integration test) — full suite now 87 passed, 1 skipped (was 83/1). Ran
+  codespell/ruff/mypy/complexipy/pylint, diffed vs. pre-change baseline — no new
+  issues; `diff_preamble_tables` complexity rose 10→19, still under the 20 threshold.
+- Updated `DOCUMENTATION.md`, `AI_REASONING.md`, `INVESTIGATION.md`.
+**Outcome:** Tool confirmed usable end-to-end on this third real document; two more
+real bugs found and fixed with regression coverage; no known open issues remain.

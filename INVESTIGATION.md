@@ -121,13 +121,98 @@ resulting diff with `pdflatex`/`bibtex` to confirm a valid PDF is produced.
 
 ## Key remaining questions
 
-- None currently open for either investigation (production-model or spamr).
+- None currently open for the production-model or spamr investigations.
 
 ## Concrete next steps
 
-- No further code changes planned; both investigations are considered resolved. If a
-  future diff on a different document surfaces a *different* multiply-defined-label
-  scenario (e.g. a genuinely reused label with a legitimate cross-document meaning,
-  not just a rewritten section keeping its anchor), re-check whether the current
-  blanket-rename-on-delete approach still gives the desired result before assuming it
-  does.
+- No further code changes planned for production-model/spamr; both are considered
+  resolved. If a future diff on a different document surfaces a *different*
+  multiply-defined-label scenario (e.g. a genuinely reused label with a legitimate
+  cross-document meaning, not just a rewritten section keeping its anchor), re-check
+  whether the current blanket-rename-on-delete approach still gives the desired
+  result before assuming it does.
+
+---
+
+# Investigation: latexdiff_better.py vs. esa-rl2ocean-srs (v0.2 → v1.0)
+
+## Question
+
+Following up on AGENTS.md's stated goal: can `latexdiff_better.py` (`--git` mode)
+correctly diff the tags of the sibling repository `/home/mortenwh/esa-rl2ocean-srs`?
+(AGENTS.md names "v0.1"/"v1.0"; the repo only has `v0.2` and `v1.0` — confirmed with
+the user, who chose to proceed with `v0.2`→`v1.0`.)
+
+## Method
+
+Same method as the earlier two investigations: inspect the sibling repo's file
+structure at both tags, run `latexdiff_better.py --git` (writing output outside the
+sibling repo, to `/tmp`, since another concurrent session appeared to already be
+using files inside the sibling repo itself — read via `git show` never requires
+writing into the sibling repo), then compile the resulting diff with
+`pdflatex`/`bibtex` to confirm a valid PDF is produced. Also independently verified
+the `\appendix` finding (below) with a minimal standalone LaTeX snippet, isolated from
+the diff pipeline, to distinguish a diff-tool bug from a pre-existing document/package
+incompatibility.
+
+## Conclusions so far
+
+- **Main file renamed here too**: `rl2ocean_srs.tex` (v0.2) → `main.tex` (v1.0). Same
+  pattern as production-model/spamr; handled by the existing `--old-main` flag, no
+  code change needed.
+- **This is the most CSV-heavy document tested so far**: 44 body table environments
+  expanded from `\csvlongtable`/`\csvlongtbd`/`\csvlongtrace` commands (vs. 0 for
+  spamr). This exercised the CSV-expansion and preamble-table-diffing code paths much
+  more heavily than either prior investigation, and surfaced two new, previously
+  latent bugs — both are now fixed (see `DOCUMENTATION.md` for full detail,
+  `AI_REASONING.md` for the alternatives considered):
+  - **Bug 9 (fatal compile error)**: `diff_preamble_tables()` paired preamble tables
+    (found inside `\newcommand{...}` macro bodies) purely by position. A macro
+    inserted before the existing CSV-table macros in v1.0's preamble shifted every
+    later pairing, causing structurally unrelated macro templates (different column
+    counts) to be diffed cell-by-cell against each other, corrupting the macro
+    bodies (unbalanced braces → fatal pdflatex "Runaway argument" error). Fixed with
+    name-based pairing (by enclosing `\newcommand{\name}`) plus a structural
+    compatibility safety net that skips diffing (passes the new table through
+    unchanged) when paired tables have different column counts.
+  - **Bug 10 (fatal compile error)**: `\appendix` (a side-effecting, argument-less
+    structural command) was missing from `_COMMENT_DEL_RE`, so a deleted `\appendix`
+    (the entire appendix section was removed between v0.2 and v1.0) was rendered as
+    `{\color{BUR}\appendix}` and still executed. This document's
+    `\usepackage{appendix}` + `\usepackage{fncychap}` combination on the `article`
+    class fails with `No counter 'chapter' defined` the moment `\appendix` executes
+    at all — verified independently with a minimal standalone reproduction, isolating
+    that this is triggered by executing `\appendix` itself (not by the `{\color{}}`
+    wrapping). Fixed by adding `\appendix` to `_COMMENT_DEL_RE`, matching the existing
+    treatment of `\section`/`\chapter`/`\begin`/`\end`.
+- End-to-end verification: `python3 latexdiff_better.py --git
+  /home/mortenwh/esa-rl2ocean-srs v0.2 v1.0 main.tex --old-main rl2ocean_srs.tex
+  output.tex` now produces a `diff.tex` that compiles cleanly (`pdflatex` ×3,
+  `bibtex` — no citations, expected) to a 67-page PDF with zero fatal errors.
+  Remaining warnings are expected/cosmetic: dangling `\ref{}` calls inside deleted
+  prose that referenced labels defined only inside the now-fully-deleted appendix
+  section (correctly renamed to `_old` per the Bug 8 fix, so these refs legitimately
+  have nothing to resolve to — the same class of limitation already documented for
+  restructured/moved content), plus unrelated PDF/font-metadata noise.
+- Regression tests added: `TestBug9PreambleTableNamePairing` (2 tests, unit-level on
+  `diff_preamble_tables` directly), `TestBug10AppendixCommentedOnDelete` (1 test),
+  `TestIntegrationRl2oceanSrsOldMainRename` (1 test, full real-repo integration test,
+  skipped if the sibling repo/`pdflatex`/`bibtex` are not present). Full suite: 87
+  passed, 1 skipped (up from 83/1).
+
+## Key remaining questions
+
+- None currently open for this investigation — the tool is confirmed usable,
+  end-to-end, for this document pair.
+
+## Concrete next steps
+
+- No further code changes planned for the srs investigation; it is considered
+  resolved. If a future document surfaces *another* preamble-table-pairing
+  mismatch that the name-based + structural-compatibility approach doesn't catch
+  (e.g. two same-named macros with genuinely different table content that both
+  happen to have the same column count), revisit `diff_preamble_tables()` then.
+- If a future document uses another side-effecting, argument-less structural
+  command not yet in `_COMMENT_DEL_RE` (Bug 10's class of issue), add it there
+  following the same pattern.
+

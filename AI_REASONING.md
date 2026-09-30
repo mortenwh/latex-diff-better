@@ -122,3 +122,94 @@ those labels from a position where the ambiguity mattered). Following AGENTS.md'
 guessed at and silently patched. The user then confirmed the fix direction (rename the
 deleted label) in a follow-up turn — see the dedicated reasoning entry above for the
 implementation that was agreed on and applied.
+
+## 2026-09-30 — Preamble table pairing: name-based vs. safety-check-only (Bug 9)
+
+**Problem:** Diffing `esa-rl2ocean-srs` v0.2→v1.0 crashed pdflatex with a "Runaway
+argument" error inside a `\newcommand{\csvlongtable}...` macro body. Root cause:
+`diff_preamble_tables()` paired preamble tables purely by position, and v1.0 inserted
+a new, unrelated macro-with-table before the existing CSV-table macros, shifting every
+later pairing so structurally unrelated table templates (different column counts,
+different `\csvcoli`-style placeholders) got diffed cell-by-cell, corrupting the
+macro body.
+
+**Options presented to the user (via `ask_user`):**
+1. Name-based pairing only (match by enclosing `\newcommand{\name}`).
+2. Safety-check-only (detect structural incompatibility, skip diffing if mismatched,
+   keep positional pairing otherwise).
+3. Both.
+
+**User chose "both".** Reasoning for why both are complementary rather than
+redundant: name-based pairing fixes the *common* case (a macro is genuinely
+inserted/removed/reordered — the exact scenario that broke here) by using the most
+reliable available signal (the macro's own name) instead of a fragile ordinal
+position. But name-based pairing alone cannot help when no macro name can be
+determined at all (e.g. a bare `\begin{tabular}...}` sitting directly in the preamble,
+not inside any `\newcommand`) — for that residual case, pairing still falls back to
+position, which can still occasionally pair two genuinely unrelated tables. The
+structural-compatibility safety net (`_tables_structurally_compatible`, comparing
+heuristically-detected column counts) is what actually prevents *any* mismatched pair
+— named or positional — from being diffed and corrupted; it is the last line of
+defense, not merely a redundant second check.
+
+**Why column-count comparison, not exact content/structure comparison:** An exact
+"are these really the same table" check would require understanding table semantics
+deeply (row/column meaning, not just count) — overkill for a safety net whose only
+job is "don't corrupt the output", not "diff correctly in every case". A column-count
+mismatch is a cheap, robust signal that two tables are very unlikely to be the same
+logical table (in every real case observed so far, genuinely-paired old/new tables of
+the same macro have matched column counts; only truly-unrelated tables differ). If
+the heuristic ever produces a false negative (skips a pair that could have been safely
+diffed), the fallback (pass the new table through unchanged) is always safe — never
+worse than the previous unconditional-positional-pairing behavior, only ever more
+conservative where it matters.
+
+## 2026-09-30 — Complexity note: `diff_preamble_tables` rose from 10 to 19
+
+Adding name-based pairing (with a dict/list bookkeeping loop) and the structural
+safety-net check raised `diff_preamble_tables`'s complexipy cognitive-complexity score
+from 10 to 19 — still under the project's 20-point acceptability threshold (AGENTS.md),
+though above complexipy's own stricter default flag threshold (which is lower than 20).
+Not restructured further: the function's logic (collect named/unnamed old tables into
+lookup structures once, then walk new tables pairing/checking/diffing each) is already
+about as flat as this three-way fallback logic (name match → positional fallback →
+structural-compatibility gate) can reasonably be without splitting into multiple tiny
+one-call helper functions that would only obscure the single, easy-to-follow control
+flow for a reader. `_preceding_macro_name` and `_table_column_count` /
+`_tables_structurally_compatible` were already extracted as separate, individually
+low-complexity helpers (scores 5 and 13 respectively) specifically to keep
+`diff_preamble_tables` itself as simple as this pairing logic allows.
+
+## 2026-09-30 — `\appendix` fix: comment-out vs. a more targeted "run-once" guard (Bug 10)
+
+**Problem:** A deleted `\appendix` (the whole appendix section was removed between
+v0.2 and v1.0) was rendered as `{\color{BUR}\appendix}` and still executed, and this
+document's `\usepackage{appendix}` + `\usepackage{fncychap}` + `article`-class
+combination fails outright (`No counter 'chapter' defined`) the instant `\appendix`
+executes at all — verified independently with a minimal standalone snippet containing
+just those three ingredients and a bare `\appendix` (no diff markup at all), confirming
+this is not specific to the `{\color{}}` wrapping.
+
+**Options considered:**
+1. A narrow, `\appendix`-specific guard (e.g. only comment it out if some heuristic
+   detects the class/package combination is "risky"). Rejected: overly specific,
+   fragile, and solves nothing for the *next* side-effecting argument-less structural
+   command found on some other real document — `\appendix`'s underlying problem
+   (executing a layout-changing command for content that, semantically, "doesn't
+   exist" in the diffed timeline) is identical in kind to why `\section{...}`/
+   `\chapter{...}`/`\begin{...}`/`\end{...}` are already unconditionally commented out
+   when deleted.
+2. Add `\appendix` to the existing `_COMMENT_DEL_RE` list. Chosen approach — it is the
+   direct, minimal application of an already-established, already-tested pattern in
+   this codebase (comment out structural side-effecting commands rather than execute
+   them for deleted content), requiring only a one-line regex addition and no new
+   logic.
+
+**Verification:** confirmed the isolated `\appendix`+`fncychap`+`appendix`-package+
+`article`-class combination fails even completely outside this tool's diff pipeline
+(bare `\appendix` in a minimal document), establishing that the *underlying*
+incompatibility is a pre-existing property of that package combination on this
+system's TeX Live — not something introduced by the diff tool. The diff tool's own
+bug was solely that it executed a *deleted* `\appendix` at all, which it now no longer
+does (matching how it already never executes a deleted `\section`/`\chapter`).
+

@@ -483,6 +483,122 @@ class TestPreambleDiffVisible:
 
 
 # ---------------------------------------------------------------------------
+# Bug 9 — preamble tables must be paired by macro name, not position, and
+# only diffed when structurally compatible (found while diffing esa-rl2ocean-srs)
+# ---------------------------------------------------------------------------
+
+class TestBug9PreambleTableNamePairing:
+    r"""Bug 9 (compilation error): diff_preamble_tables() used to pair preamble
+    tables purely by position (1st old <-> 1st new, etc.). Inserting a new
+    \newcommand with its own table template *before* an existing one in the
+    new preamble shifted every later pairing by one, causing structurally
+    unrelated macro-template tables (different column counts) to be diffed
+    cell-by-cell against each other, corrupting the macro bodies (unbalanced
+    braces -> fatal pdflatex "Runaway argument" error).
+
+    Fix: pair tables by the name of their enclosing \newcommand{\name} macro
+    (falling back to positional pairing when no name can be determined), and
+    as a safety net, only actually diff a pair if both tables have the same
+    heuristically-detected column count -- otherwise pass the new table
+    through unchanged, exactly like an unpaired table.
+    """
+
+    def test_inserted_macro_does_not_shift_pairing(self):
+        r"""A brand-new \newcommand+table inserted before an existing one in
+        the new preamble must not cause the existing table to be paired with
+        it; the existing table must still be paired with its same-named
+        old counterpart."""
+        old_p = (
+            r"\newcommand{\mytable}{%" + "\n"
+            r"\begin{tabular}{|l|l|}" + "\n"
+            r"\hline" + "\n"
+            r"A & Old value \\" + "\n"
+            r"\hline" + "\n"
+            r"\end{tabular}}" + "\n"
+        )
+        new_p = (
+            r"\newcommand{\othertable}{%" + "\n"
+            r"\begin{tabular}{|l|l|l|}" + "\n"
+            r"\hline" + "\n"
+            r"X & Y & Z \\" + "\n"
+            r"\hline" + "\n"
+            r"\end{tabular}}" + "\n"
+            r"\newcommand{\mytable}{%" + "\n"
+            r"\begin{tabular}{|l|l|}" + "\n"
+            r"\hline" + "\n"
+            r"A & New value \\" + "\n"
+            r"\hline" + "\n"
+            r"\end{tabular}}" + "\n"
+        )
+        result = ldb.diff_preamble_tables(old_p, new_p)
+        # The unrelated 3-column table must pass through unchanged (no diff markup).
+        assert r'X & Y & Z' in result
+        assert 'diffdel' not in result.split(r'\newcommand{\mytable}')[0], (
+            "The unrelated inserted table must not receive diff markup"
+        )
+        # \mytable must still be correctly diffed against its old counterpart
+        # (word-level diff renders the changed cell as \sout{Old} \textcolor{ao}{New}).
+        my_table_part = result.split(r'\newcommand{\mytable}')[1]
+        assert r'\sout{Old}' in my_table_part and r'\textcolor{ao}{New}' in my_table_part, (
+            "mytable must be diffed against its same-named old counterpart, "
+            "not the newly inserted unrelated table"
+        )
+
+    def test_structurally_incompatible_pair_passed_through(self):
+        r"""Two same-position tables with different column counts (e.g. a
+        genuine content/structure change, or a positional-fallback mismatch)
+        must be passed through unchanged rather than diffed cell-by-cell."""
+        old_p = (
+            r"\begin{tabular}{|l|l|}" + "\n"
+            r"\hline" + "\n"
+            r"A & B \\" + "\n"
+            r"\hline" + "\n"
+            r"\end{tabular}" + "\n"
+        )
+        new_p = (
+            r"\begin{tabular}{|l|l|l|}" + "\n"
+            r"\hline" + "\n"
+            r"X & Y & Z \\" + "\n"
+            r"\hline" + "\n"
+            r"\end{tabular}" + "\n"
+        )
+        result = ldb.diff_preamble_tables(old_p, new_p)
+        assert result == new_p, (
+            "Structurally incompatible tables must be passed through unchanged"
+        )
+        assert '{' in result and result.count('{') == result.count('}'), (
+            "Output braces must remain balanced"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug 10 — deleted \appendix must be commented out, not executed
+# ---------------------------------------------------------------------------
+
+class TestBug10AppendixCommentedOnDelete:
+    r"""Bug 10 (compilation error): \appendix is a side-effecting structural
+    command (switches heading numbering mode) with no argument. It was
+    missing from _COMMENT_DEL_RE, so a deleted \appendix was rendered as
+    {\color{BUR}\appendix} and still executed. On some class/package
+    combinations (e.g. fncychap + appendix on the article class, as used by
+    esa-rl2ocean-srs) this fails outright with "No counter 'chapter'
+    defined" the moment \appendix executes at all. Fixed by adding \appendix
+    to _COMMENT_DEL_RE so deleted \appendix becomes a % DIFF-DEL: comment
+    (never executed), matching the existing treatment of \section/\chapter/
+    \begin/\end.
+    """
+
+    def test_deleted_appendix_is_commented_out(self):
+        r"""A deleted \appendix must become a % DIFF-DEL: comment, not
+        {\color{BUR}\appendix}."""
+        out = ldb.diff_text_block("\\appendix\n", "")
+        assert '% DIFF-DEL:' in out and r'\appendix' in out
+        assert r'{\color{BUR}\appendix}' not in out, (
+            r"Deleted \appendix must never be executed via {\color{}} wrapping"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Regression tests — known-good behaviour must not break
 # ---------------------------------------------------------------------------
 
@@ -1298,5 +1414,62 @@ class TestIntegrationRl2oceanOldMainRename:
                 ["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest
             )
             assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
+        assert (dest / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.path.isdir("/home/mortenwh/esa-rl2ocean-srs"),
+    reason="esa-rl2ocean-srs repo not present",
+)
+@pytest.mark.skipif(
+    shutil.which("pdflatex") is None or shutil.which("bibtex") is None,
+    reason="pdflatex or bibtex not available",
+)
+class TestIntegrationRl2oceanSrsOldMainRename:
+    """Repo-level integration test: esa-rl2ocean-srs v0.2 -> v1.0.
+
+    Regression coverage for Bug 9 (preamble table positional-pairing
+    corruption caused by an inserted macro) and Bug 10 (deleted \\appendix
+    executing and erroring on this document's fncychap+appendix+article
+    combination), both found while diffing this real document. The main file
+    was also renamed rl2ocean_srs.tex -> main.tex between tags (--old-main),
+    and the document uses \\csvlongtable-driven CSV requirement tables
+    extensively (44 body table environments as of v0.2/v1.0).
+    """
+
+    SCRIPT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "latexdiff_better.py",
+    )
+    REPO = "/home/mortenwh/esa-rl2ocean-srs"
+
+    def test_old_main_rename_compiles(self, tmp_path):
+        """v0.2 (rl2ocean_srs.tex) -> v1.0 (main.tex) diff must compile to PDF."""
+        dest = tmp_path / "repo"
+        shutil.copytree(self.REPO, dest, symlinks=True)
+
+        rc, out = _run(
+            [
+                sys.executable, self.SCRIPT, "--git", "v0.2", "v1.0", "main.tex",
+                "--old-main", "rl2ocean_srs.tex", "diff.tex",
+            ],
+            cwd=dest,
+        )
+        assert rc == 0, f"Script failed:\n{out}"
+        assert (dest / "diff.tex").exists(), "diff.tex was not created"
+        diff_text = (dest / "diff.tex").read_text(encoding="utf-8")
+        assert r'{\color{BUR}\appendix}' not in diff_text, (
+            r"Deleted \appendix must be commented out, not executed"
+        )
+
+        for ext in ("aux", "bbl", "blg", "toc", "out"):
+            (dest / f"diff.{ext}").unlink(missing_ok=True)
+
+        _run(["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest)
+        rc, out = _run(
+            ["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest
+        )
+        assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
         assert (dest / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"
 

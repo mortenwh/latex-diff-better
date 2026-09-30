@@ -78,7 +78,7 @@ mamba activate latexdiff-better
 pytest -q
 ```
 
-As of the last verified run: 83 passed, 1 skipped (skip reason: an optional dependency
+As of the last verified run: 87 passed, 1 skipped (skip reason: an optional dependency
 of one test is unavailable — see test file for details), 0 failed.
 
 Tests are marked `integration` (see `pytest.ini`) when they invoke `pdflatex`/`bibtex`
@@ -123,6 +123,13 @@ grouping, in file order:
 - **Preamble handling**: `split_preamble_body`, `diff_preamble_tables`,
   `inject_diff_packages` — diff preamble-defined tables, inject the packages
   (`xcolor`, `ulem`, etc.) needed by the diff markup into the new preamble.
+  `diff_preamble_tables` pairs old/new tables by the name of their enclosing
+  `\newcommand{\name}` macro where one can be determined (falling back to
+  positional pairing otherwise), and only actually diffs a pair if both tables
+  have the same heuristically-detected column count (`_table_column_count`,
+  `_tables_structurally_compatible`) — otherwise the new table is passed through
+  unchanged. This avoids corrupting a macro body when tables are inserted,
+  removed, or reordered in the preamble between versions (see Bug 9 below).
 - **Legend page**: `make_diff_legend_page`, `_tex_escape_label` — generate the
   human-readable colour-coding legend page prepended to diff output (see README).
 - **`main()`**: CLI argument parsing and pipeline orchestration. Two invocation modes:
@@ -218,4 +225,65 @@ Compiled cleanly (`pdflatex` ×3, `bibtex` — no citations in this doc so bibte
 nothing to do, which is expected) to a 26-page PDF with zero errors and zero warnings
 (after the `\label` rename fix above; before it, this document is exactly what
 surfaced the three "Label ... multiply defined" warnings).
+
+## Investigation: v0.2 → v1.0 diff of esa-rl2ocean-srs
+
+Verified (2026-09-30) that `latexdiff_better.py --git` correctly diffs the `v0.2` →
+`v1.0` tags of the sibling `esa-rl2ocean-srs` repository (AGENTS.md's stated
+investigation target referred to "v0.1", but that tag does not exist in this repo —
+only `v0.2` and `v1.0` — confirmed with the user before proceeding). This document is
+the most CSV-table-heavy of the three sibling documents investigated so far (44 body
+table environments expanded from `\csvlongtable`/`\csvlongtbd`/`\csvlongtrace` CSV
+commands), and surfaced two new, real bugs, both now fixed:
+
+1. **Main file renamed here too**: `rl2ocean_srs.tex` (v0.2) → `main.tex` (v1.0).
+   Handled with the existing `--old-main rl2ocean_srs.tex` flag; no code change
+   needed.
+2. **Bug 9 (compilation error) — preamble table positional-pairing corruption**:
+   `diff_preamble_tables()` used to pair preamble tables (found inside
+   `\newcommand{...}` macro bodies — e.g. the `\csvlongtable`/`\csvlongtbd`/
+   `\csvlongtrace` template definitions) purely by position (1st old table ↔ 1st new
+   table, etc.). In v1.0, a brand-new macro (an unrelated "Method name" table
+   template) was inserted *before* the existing CSV-table macros in the preamble.
+   This shifted every later pairing by one, so e.g. the old `\csvlongtable` template
+   got diffed cell-by-cell against the new, unrelated "Method name" table — two
+   templates with different column counts and different `\csvcoli`-style
+   placeholders — corrupting the macro body with unbalanced braces (fatal pdflatex
+   "Runaway argument" error). Fixed by pairing preamble tables by the name of their
+   enclosing `\newcommand{\name}` macro (`_preceding_macro_name`), falling back to
+   positional pairing when no name can be determined, with a structural
+   compatibility safety net (`_table_column_count`, `_tables_structurally_compatible`)
+   that skips diffing (passes the new table through unchanged) if the paired tables'
+   column counts don't match. Regression tests: `TestBug9PreambleTableNamePairing`.
+3. **Bug 10 (compilation error) — deleted `\appendix` executing**: `\appendix` is a
+   side-effecting structural command (switches heading numbering to alphabetic) with
+   no argument, but was missing from `_COMMENT_DEL_RE` (the list of commands that must
+   always be commented out rather than executed when deleted). A deleted `\appendix`
+   (the whole appendix section was removed between v0.2 and v1.0) was rendered as
+   `{\color{BUR}\appendix}` and still executed. This document's
+   `\usepackage{appendix}` + `\usepackage{fncychap}` combination on the `article`
+   class fails with `! LaTeX Error: No counter 'chapter' defined.` the moment
+   `\appendix` executes at all (reproduced independently in a minimal standalone
+   snippet, confirming this is triggered by executing `\appendix` itself, not by the
+   `{\color{}}` wrapping). Fixed by adding `\appendix` to `_COMMENT_DEL_RE`, matching
+   the existing treatment of `\section`/`\chapter`/`\begin`/`\end`. Regression tests:
+   `TestBug10AppendixCommentedOnDelete`.
+
+Example invocation used to reproduce/verify:
+
+```bash
+python3 latexdiff_better.py --git /home/mortenwh/esa-rl2ocean-srs \
+    v0.2 v1.0 main.tex --old-main rl2ocean_srs.tex /tmp/srs_diff.tex
+```
+
+Compiled cleanly (`pdflatex` ×3, `bibtex` — no citations in this doc so bibtex found
+nothing to do, expected) to a 67-page PDF with zero fatal errors. Remaining warnings
+are expected and cosmetic: dangling `\ref{}` calls inside deleted (struck-through)
+prose that referenced figures/labels defined only inside the now-fully-deleted
+appendix section (the labels are correctly renamed to `_old` per the Bug 8 fix, so
+these `\ref`s legitimately have nothing to resolve to — same class of limitation
+already documented for moved/restructured content), plus a handful of unrelated
+pre-existing PDF/font warnings (duplicate PDF destination identifier, missing PK font
+bitmaps regenerated on the fly) that are cosmetic TeX Live/PDF-metadata noise, not
+diff-tool correctness issues.
 

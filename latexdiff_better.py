@@ -163,13 +163,17 @@ _NOSOUT_RE = re.compile(
 #   - \begin / \end — would open/close real environments in the wrong place
 #   - \item — needs its enclosing list environment
 #   - section commands — would add numbered headings / shift numbering
+#   - \appendix — switches heading numbering mode; some class/package
+#     combinations (e.g. fncychap + appendix on the article class) error out
+#     ("No counter 'chapter' defined") the moment it executes at all, so a
+#     deleted \appendix must never be executed
 #   - TikZ picture commands — require an active tikzpicture environment
 #   - algorithmic / algorithm2e commands — require an active algorithmic env
 #   - acronym / glossaries list-entry commands — must be inside their env
 _COMMENT_DEL_RE = re.compile(
     r'\\begin\{|\\end\{|\\item\b'
     r'|\\chapter\*?\{|\\section\*?\{|\\subsection\*?\{'
-    r'|\\subsubsection\*?\{|\\paragraph\*?\{'
+    r'|\\subsubsection\*?\{|\\paragraph\*?\{|\\appendix\b'
     # TikZ picture commands (must be inside tikzpicture)
     r'|\\node\b|\\coordinate\b|\\path\b|\\draw\b|\\fill\b|\\filldraw\b'
     r'|\\clip\b|\\shade\b|\\tikzset\b|\\tikzstyle\b'
@@ -1844,29 +1848,118 @@ def split_preamble_body(text):
     return text[:m.end()], text[m.end():]
 
 
+_NEWCOMMAND_NAME_RE = re.compile(r'\\(?:re)?newcommand\*?\{\\(\w+)\}')
+
+
+def _preceding_macro_name(segs, table_idx):
+    """Return the name of the \\newcommand{\\name} that most closely precedes
+    segs[table_idx] (a 'table' segment), or None if no such macro is found.
+
+    Only looks at the immediately preceding 'text' segment — this is where a
+    \\newcommand{\\name}[1]{...\\begin{tabular}...} opens the macro whose body
+    contains the table, so the macro name always appears there.
+    """
+    if table_idx == 0:
+        return None
+    prev_type, prev_content = segs[table_idx - 1]
+    if prev_type != 'text':
+        return None
+    matches = _NEWCOMMAND_NAME_RE.findall(prev_content)
+    return matches[-1] if matches else None
+
+
+def _table_column_count(table_content):
+    """Return the approximate number of columns declared by a table's column
+    spec (the brace group(s) right after \\begin{env}), or None if it cannot
+    be determined. Used only as a structural-compatibility heuristic, not for
+    exact correctness.
+    """
+    m = re.match(r'\\begin\{[a-zA-Z*]+\}', table_content)
+    if not m:
+        return None
+    pos = m.end()
+    colspec = None
+    while pos < len(table_content) and table_content[pos] in ' \t\n':
+        pos += 1
+    while pos < len(table_content) and table_content[pos] == '{':
+        grp = match_brace_group(table_content, pos)
+        if grp is None:
+            break
+        colspec = table_content[pos + 1:grp[1] - 1]
+        pos = grp[1]
+        while pos < len(table_content) and table_content[pos] in ' \t\n':
+            pos += 1
+    if colspec is None:
+        return None
+    # Strip nested brace groups (e.g. p{2cm}, @{}, >{\raggedright}) repeatedly,
+    # since their contents may contain letters unrelated to column count.
+    stripped = colspec
+    prev = None
+    while prev != stripped:
+        prev = stripped
+        stripped = re.sub(r'\{[^{}]*\}', '', stripped)
+    count = len(re.findall(r'[A-Za-z]', stripped))
+    return count if count > 0 else None
+
+
+def _tables_structurally_compatible(old_table, new_table):
+    """Return True if two tables have a compatible-enough column count to be
+    safely diffed cell-by-cell. Returns True (permissive) if the column count
+    cannot be determined for either table.
+    """
+    old_cols = _table_column_count(old_table)
+    new_cols = _table_column_count(new_table)
+    if old_cols is None or new_cols is None:
+        return True
+    return old_cols == new_cols
+
+
 def diff_preamble_tables(old_preamble, new_preamble):
     """
     Diff only the TABLE segments inside the preamble (i.e. xltabular/tabular
     environments embedded in \\newcommand definitions).  All non-table text is
     taken from the new preamble unchanged — diffing arbitrary preamble code
     (\\documentclass, \\usepackage, \\ifthenelse …) would produce invalid LaTeX.
-    Tables are paired positionally (1st old table ↔ 1st new table, etc.).
+
+    Tables are paired by the name of their enclosing \\newcommand{\\name} macro
+    where one can be determined (so inserting/removing/reordering a macro in
+    the preamble does not shift later pairings), falling back to positional
+    pairing for tables with no identifiable enclosing macro name. As a final
+    safety net, a pair is only actually diffed if both tables have the same
+    (heuristically detected) column count — otherwise the new table is passed
+    through unchanged, exactly as an unpaired table would be. This prevents
+    structurally unrelated templates (e.g. a differently-shaped macro table
+    that happens to land at the same position) from being diffed cell-by-cell
+    and corrupting the macro body.
     """
     old_segs = segment_text(old_preamble)
     new_segs = segment_text(new_preamble)
 
-    old_tables = [c for t, c in old_segs if t == 'table']
-    result = []
-    table_idx = 0
-    for seg_type, content in new_segs:
+    old_by_name: dict = {}
+    old_unnamed = []
+    for i, (seg_type, content) in enumerate(old_segs):
         if seg_type == 'table':
-            if table_idx < len(old_tables):
-                result.append(diff_tables(old_tables[table_idx], content))
+            name = _preceding_macro_name(old_segs, i)
+            if name:
+                old_by_name.setdefault(name, []).append(content)
             else:
-                result.append(content)  # new table with no old counterpart
-            table_idx += 1
-        else:
+                old_unnamed.append(content)
+
+    result = []
+    for i, (seg_type, content) in enumerate(new_segs):
+        if seg_type != 'table':
             result.append(content)
+            continue
+        name = _preceding_macro_name(new_segs, i)
+        old_table = None
+        if name and old_by_name.get(name):
+            old_table = old_by_name[name].pop(0)
+        elif not name and old_unnamed:
+            old_table = old_unnamed.pop(0)
+        if old_table is not None and _tables_structurally_compatible(old_table, content):
+            result.append(diff_tables(old_table, content))
+        else:
+            result.append(content)  # unpaired or structurally incompatible — pass through
     return ''.join(result)
 
 
