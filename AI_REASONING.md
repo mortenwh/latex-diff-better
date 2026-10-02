@@ -213,3 +213,70 @@ system's TeX Live — not something introduced by the diff tool. The diff tool's
 bug was solely that it executed a *deleted* `\appendix` at all, which it now no longer
 does (matching how it already never executes a deleted `\section`/`\chapter`).
 
+
+## 2026-10-02 — Deleted-math-environment fix needed a second, old-document depth tracker
+
+**Problem (Bug 12, esa-rl2ocean-CVA-TN investigation):** `diff_text_block()` tracks
+"sensitive environment" depth (tikzpicture, algorithmic, and — newly added this
+session — math environments/`\[...\]`/`$$...$$`) across the whole function, but the
+depth counter is explicitly defined and maintained as *output-document* depth: it is
+only advanced by lines that appear in the new/output document (`equal`, `insert`,
+and the new side of `replace` pairs). This is correct and necessary for those three
+opcodes. But a *pure* `delete` SequenceMatcher opcode (an entire
+`\begin{equation}...\end{equation}` block removed outright, with no paired "new"
+line at all) never advances this tracker — so interior content lines of such a block
+were incorrectly treated as "not sensitive" and `\sout{}`-wrapped as plain text,
+which still breaks compilation for math content whose braces happen to be balanced
+(e.g. `CDF_{sim}(x)-CDF_{m}(x)` has balanced `{}`, so the pre-existing
+unbalanced-brace fallback in `_line_is_safe_for_color()` didn't catch it either).
+
+This was caught only because a *direct* unit test (`diff_text_block()` called with an
+old string containing a complete deleted equation block with balanced-brace content)
+was written and failed, even though end-to-end compilation of the real CVA-TN
+document already showed 0 fatal errors — meaning the real document's specific deleted
+equation blocks happened not to hit this exact pure-delete + balanced-braces
+combination (its math-block deletions were apparently all `replace`-paired against
+new content, or had other unbalanced-brace characteristics that the existing
+fallback already caught). This reinforces a general lesson for this codebase:
+**real-document regression testing alone is not sufficient to confirm a fix is
+general** — a single real document exercises only the specific opcode/content
+combinations its particular edits happen to produce, not the full space of
+SequenceMatcher opcode types a general-purpose line differ must handle correctly.
+Direct unit tests targeting the *mechanism* (not just the symptom observed in one
+document) are necessary to close this kind of gap.
+
+**Fix:** added a second, parallel depth tracker (`old_sensitive_depth`,
+`old_dollar_display_active`, `_track_depth_old()`, `_in_sensitive_context_old()`)
+that is advanced by exactly the lines that exist in the *old* document: `equal`
+lines (shared by both documents), `delete` lines, and the old side of every
+`replace` pairing/remainder (paired loop and the old-only tail). The `delete` and
+old-only-tail branches now force-comment based on `_in_sensitive_context_old()`
+(checked *before* advancing the tracker with the current line, then OR'd with
+`_touches_sensitive_delim()` for the delimiter-line-itself case — mirroring the
+existing new-tracker pattern) instead of the previous (observed to be at least
+partially coincidental) output-depth-only check. The paired-replace branch now ORs
+together both the new-tracker and old-tracker conditions, since either side being
+sensitive should force the old line to be commented rather than word-diffed.
+
+**Deliberately not fixed (documented, deferred):** the `section_rename` branch's
+`ob[1:]`/`nb[1:]` remainder loops (for a detected section-heading rename within a
+`replace` opcode) still do not consult either sensitive-context tracker at all. This
+is a pre-existing gap (predates this session), not something this session's changes
+regressed, and was not observed to be hit by any real document tested so far (a
+section rename immediately abutting a math/sensitive environment is a fairly unusual
+document edit). Left as a known limitation in `INVESTIGATION.md`'s "Key remaining
+questions" rather than fixed speculatively, per the project's "simplicity first" /
+"don't fix unrelated pre-existing issues" conventions — if a future document
+surfaces this combination, the same old-tracker mechanism added here should be
+extended to those two loops.
+
+**Complexity note:** `diff_text_block()`'s complexipy cognitive-complexity score was
+already 153 (far above the project's 20-point threshold) before this session even
+started, and rose to 164 across this session's fixes. This pre-existing violation
+does not appear to have been flagged or discussed with the user in any prior
+session's documentation. Rather than attempt an unplanned refactor of an
+already-very-large, actively-in-use function as a side effect of this bug-fix
+session (risking new regressions in a function with no existing test coverage of
+every branch combination), this was logged as an open question for the user in
+`INVESTIGATION.md`, to be addressed as a dedicated, deliberate future task if the
+user agrees it's warranted.

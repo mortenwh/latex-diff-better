@@ -157,6 +157,13 @@ _NOSOUT_RE = re.compile(
     r'|\\(?:name|auto|c)ref\b'  # \nameref, \autoref, \cref — hyperref cross-references
 )
 
+# A raw (unescaped) '#' character — e.g. inside \url{...#...} or
+# \href{...#...} — breaks hyperref's \textcolor{}{} patch ("Illegal parameter
+# number in definition of \Hy@tempa"): hyperref pre-scans \textcolor's
+# argument via \edef before \url/\href gets a chance to locally change '#'s
+# catcode. The {\color{}...} group form is not patched this way and is safe.
+_RAW_HASH_RE = re.compile(r'(?<!\\)#')
+
 # Lines that must ALWAYS be output as ``% DIFF-DEL: ...`` comments rather than
 # wrapped in {\color{}} or \sout{}.  Executing these outside their required
 # parent environment causes fatal LaTeX errors:
@@ -170,8 +177,11 @@ _NOSOUT_RE = re.compile(
 #   - TikZ picture commands — require an active tikzpicture environment
 #   - algorithmic / algorithm2e commands — require an active algorithmic env
 #   - acronym / glossaries list-entry commands — must be inside their env
+#   - \[ / \] — display-math delimiters; executing one without its matching
+#     partner (e.g. only the open or close half survives a partial edit)
+#     leaves math mode open/closed incorrectly for the rest of the document
 _COMMENT_DEL_RE = re.compile(
-    r'\\begin\{|\\end\{|\\item\b'
+    r'\\begin\{|\\end\{|\\item\b|\\\[|\\\]'
     r'|\\chapter\*?\{|\\section\*?\{|\\subsection\*?\{'
     r'|\\subsubsection\*?\{|\\paragraph\*?\{|\\appendix\b'
     # TikZ picture commands (must be inside tikzpicture)
@@ -223,15 +233,24 @@ def add_markup(text):
     returned as-is: a comment added in the new version has no visible content
     to colour and wrapping it would produce \\textcolor{ao}{}%..., which
     comments out any markup following it on the same output line.
+
+    Falls back to the {\\color{ao}...} group form (instead of \\textcolor{ao}{})
+    when the text contains a raw '#' (see _RAW_HASH_RE) — e.g. a \\url or \\href
+    whose target has a URL fragment — since \\textcolor{}{} is incompatible with
+    this under hyperref.
     """
     m = re.search(r'(?<!\\)%', text)
+    comment_suffix = ''
     if m:
         before = text[:m.start()]
         if not before.strip():
             # Entire content is a comment — pass through without colour markup
             return text
-        return r'\textcolor{ao}{' + before + '}' + text[m.start():]
-    return r'\textcolor{ao}{' + text + '}'
+        comment_suffix = text[m.start():]
+        text = before
+    if _RAW_HASH_RE.search(text):
+        return r'{\color{ao}' + text + '}' + comment_suffix
+    return r'\textcolor{ao}{' + text + '}' + comment_suffix
 
 
 _LABEL_RE = re.compile(r'\\label\{([^{}]*)\}')
@@ -475,6 +494,20 @@ def segment_text(text):
 # Row and cell parsing
 # ---------------------------------------------------------------------------
 
+# Trailing row-end marker shared by split_cells(), count_cells(),
+# row_trailing() and _split_rows_brace_aware(): the row-terminating \\ (with
+# an optional [dim]) followed by any number of rule commands that may trail
+# it in the source (\hline, \hhline{...}, \cline{...}).  All four call sites
+# must agree on this pattern — otherwise a rule command straddling two rows
+# (e.g. "...\\ \hhline{=======}" at the end of row N) gets glued onto the
+# start of row N+1's first cell instead of staying attached to row N,
+# corrupting the next row's first cell when markup is applied to it.
+_ROW_END_PATTERN = (
+    r'\\\\(?:\[.*?\])?'
+    r'(?:\s*(?:\\hline\b|\\hhline\{[^}]*\}|\\cline\{[^}]*\}))*'
+)
+
+
 def _split_brace_aware(text, sep_char):
     r"""Split *text* at *sep_char* characters that are at brace depth 0.
 
@@ -519,12 +552,12 @@ def split_cells(row_text):
     groups (e.g. inside \\makecell{} or \\multicolumn arguments).  Leading
     structural commands (\\hline, \\endhead, …) are stripped first via
     row_leading() so they do not end up in the first cell.  The trailing
-    \\\\ row-end marker and any following \\hline are also removed before
-    splitting.
+    \\\\ row-end marker and any following \\hline/\\hhline{}/\\cline{} are
+    also removed before splitting.
     """
     body = row_text[len(row_leading(row_text)):]
-    # Remove trailing \\ (row end marker) and \hline
-    body = re.sub(r'(\\\\(?:\[.*?\])?(?:\s*\\hline)*)$', '', body)
+    # Remove trailing \\ (row end marker) and \hline/\hhline{}/\cline{}
+    body = re.sub(r'(' + _ROW_END_PATTERN + r')$', '', body)
     return [c.strip() for c in _split_brace_aware(body, '&')]
 
 
@@ -535,35 +568,37 @@ def count_cells(row_text):
     counting so they don't contribute spurious & characters.
     """
     body = row_text[len(row_leading(row_text)):]
-    body = re.sub(r'(\\\\(?:\[.*?\])?(?:\s*\\hline)*)$', '', body)
+    body = re.sub(r'(' + _ROW_END_PATTERN + r')$', '', body)
     return len(_split_brace_aware(body, '&')) - 1
 
 
 def row_trailing(row_text):
-    r"""Extract the trailing \\ and optional \hline suffix from a row string.
+    r"""Extract the trailing \\ and optional \hline/\hhline{}/\cline{} suffix.
 
     Returns the matched suffix (e.g. r'\\\\hline') or the default r'\\\hline'
     if no trailing row-end marker is found.  Used to preserve the original
     row terminator when reconstructing modified rows.
     """
-    m = re.search(r'(\\\\(?:\[.*?\])?(?:\s*\\hline)*)$', row_text)
+    m = re.search(r'(' + _ROW_END_PATTERN + r')$', row_text)
     return m.group(1) if m else r'\\\hline'
 
 
 def is_structural_row(row_text):
     """Return True if the row contains only LaTeX structural commands (no data cells).
 
-    Rows consisting solely of \\hline, booktabs rules (\\toprule, \\midrule,
-    \\bottomrule, \\cmidrule, \\specialrule, \\addlinespace), arydshln rules
-    (\\Xhline, \\Xcline, \\hdashline, \\cdashline), longtable markers
-    (\\endhead, \\endfoot, \\endfirsthead, \\endlastfoot) or whitespace are
-    treated as structural — they are passed through unchanged during diffs
-    rather than being marked as added/deleted.
+    Rows consisting solely of \\hline, \\hhline{}, \\cline{}, booktabs rules
+    (\\toprule, \\midrule, \\bottomrule, \\cmidrule, \\specialrule,
+    \\addlinespace), arydshln rules (\\Xhline, \\Xcline, \\hdashline,
+    \\cdashline), longtable markers (\\endhead, \\endfoot, \\endfirsthead,
+    \\endlastfoot) or whitespace are treated as structural — they are passed
+    through unchanged during diffs rather than being marked as added/deleted.
     """
     stripped = row_text.strip()
     return bool(re.fullmatch(
         r'(?:'
         r'\\hline'
+        r'|\\hhline\{[^}]*\}'
+        r'|\\cline\{[^}]*\}'
         r'|\\toprule(?:\[[^\]]*\])?'
         r'|\\midrule(?:\[[^\]]*\])?'
         r'|\\bottomrule(?:\[[^\]]*\])?'
@@ -587,6 +622,8 @@ def is_structural_row(row_text):
 _STRUCT_PREFIX_RE = re.compile(
     r'^(?:\s*(?:'
     r'\\hline'
+    r'|\\hhline\{[^}]*\}'
+    r'|\\cline\{[^}]*\}'
     r'|\\toprule(?:\[[^\]]*\])?'
     r'|\\midrule(?:\[[^\]]*\])?'
     r'|\\bottomrule(?:\[[^\]]*\])?'
@@ -625,11 +662,12 @@ def _split_rows_brace_aware(body):
     (outside all brace groups) terminates a row.
 
     The separator (including optional \\[dim] height and any trailing
-    \hline commands) is attached to the *preceding* row, matching the
-    contract of the original regex-based split.
+    \hline/\hhline{}/\cline{} commands) is attached to the *preceding* row,
+    matching the contract of the original regex-based split.
     """
-    # Regex for the full row-end token: \\ with optional [dim] and \hline(s)
-    row_end_re = re.compile(r'\\\\(?:\[.*?\])?(?:\s*\\hline)*')
+    # Regex for the full row-end token: \\ with optional [dim] and trailing
+    # rule commands (\hline / \hhline{...} / \cline{...}).
+    row_end_re = re.compile(_ROW_END_PATTERN)
 
     rows = []
     current = []
@@ -1329,38 +1367,86 @@ def diff_text_block(old, new):
 
     # Track depth inside environments where LaTeX colour markup is unsafe:
     # tikzpicture (TikZ commands + multi-line options), algorithmic variants
-    # (environment-specific commands), verbatim-like environments.
+    # (environment-specific commands), verbatim-like environments, and
+    # display-math environments/brackets (equation, align, \[...\], …).
+    # Content lines inside a display-math block rely on the surrounding
+    # \begin{equation}/\[ for math mode; once that wrapper is commented out
+    # (e.g. the whole block was deleted), the bare math content (\Delta,
+    # x_{i}, …) is no longer valid outside math mode and breaks compilation.
     # Depth is maintained across opcodes based on what appears in the OUTPUT
     # (i.e. equal/insert/replace-new lines).  Lines that appear only in the
     # old text (delete opcode) do not change the output-document depth.
     _SENSITIVE_ENV_NAMES = (
         'tikzpicture', 'algorithmic', 'algorithm2e',
         'lstlisting', 'verbatim', 'Verbatim',
+        'equation', 'align', 'eqnarray', 'gather', 'multline',
+        'displaymath', 'flalign', 'alignat',
     )
     _sens_begin = re.compile(
-        r'\\begin\{(' + '|'.join(_SENSITIVE_ENV_NAMES) + r')\}'
+        r'\\begin\{(' + '|'.join(_SENSITIVE_ENV_NAMES) + r')\*?\}'
+        r'|\\\['
     )
     _sens_end = re.compile(
-        r'\\end\{(' + '|'.join(_SENSITIVE_ENV_NAMES) + r')\}'
+        r'\\end\{(' + '|'.join(_SENSITIVE_ENV_NAMES) + r')\*?\}'
+        r'|\\\]'
     )
+    # Legacy TeX display-math delimiter: the same token ($$) both opens and
+    # closes, so it cannot be counted like \begin{}/\end{} — it must be
+    # tracked as a toggle (odd occurrences on a line flip in/out of math mode).
+    _dollar_dollar_re = re.compile(r'(?<!\\)\$\$')
     sensitive_depth = 0
+    dollar_display_active = False
+    # Mirror tracker for the OLD document's depth, advanced only by lines that
+    # actually existed in the old text (equal, delete, and the old side of a
+    # replace pairing/remainder).  Needed because content lines inside a
+    # wholly-deleted sensitive block (a pure 'delete' opcode spanning the
+    # block's interior) never touch the OUTPUT depth tracker above — without
+    # this, such content is wrongly treated as plain text and \sout{}-wrapped,
+    # which breaks compilation for math content whose braces happen to be
+    # balanced (so it isn't already caught by the brace-balance fallback).
+    old_sensitive_depth = 0
+    old_dollar_display_active = False
 
     def _track_depth(line):
-        nonlocal sensitive_depth
+        nonlocal sensitive_depth, dollar_display_active
         sensitive_depth += len(_sens_begin.findall(line))
         sensitive_depth -= len(_sens_end.findall(line))
         sensitive_depth = max(0, sensitive_depth)
+        if len(_dollar_dollar_re.findall(line)) % 2:
+            dollar_display_active = not dollar_display_active
+
+    def _track_depth_old(line):
+        nonlocal old_sensitive_depth, old_dollar_display_active
+        old_sensitive_depth += len(_sens_begin.findall(line))
+        old_sensitive_depth -= len(_sens_end.findall(line))
+        old_sensitive_depth = max(0, old_sensitive_depth)
+        if len(_dollar_dollar_re.findall(line)) % 2:
+            old_dollar_display_active = not old_dollar_display_active
+
+    def _in_sensitive_context():
+        return sensitive_depth > 0 or dollar_display_active
+
+    def _in_sensitive_context_old():
+        return old_sensitive_depth > 0 or old_dollar_display_active
+
+    def _touches_sensitive_delim(line):
+        """True if this specific line opens/closes a sensitive env or $$ block."""
+        if _sens_begin.search(line) or _sens_end.search(line):
+            return True
+        return len(_dollar_dollar_re.findall(line)) % 2 == 1
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == 'equal':
             for line in new_lines[j1:j2]:
                 _track_depth(line)
+                _track_depth_old(line)  # equal lines exist in both documents
             result.extend(new_lines[j1:j2])
 
         elif tag == 'insert':
             for line in new_lines[j1:j2]:
+                touches = _touches_sensitive_delim(line)
                 _track_depth(line)
-                if sensitive_depth > 0:
+                if _in_sensitive_context() or touches:
                     result.append(line)  # inside sensitive env — pass through
                     continue
                 stripped = line.rstrip('\n')
@@ -1369,12 +1455,21 @@ def diff_text_block(old, new):
 
         elif tag == 'delete':
             for line in old_lines[i1:i2]:
-                # Deleted lines don't appear in the output, so don't update
-                # sensitive_depth here — depth is output-document depth.
+                # Deleted lines don't appear in the output, so the OUTPUT
+                # depth tracker is untouched here.  But they must still be
+                # force-commented if they fall inside a sensitive block *in
+                # the old document* — e.g. interior content lines of a wholly
+                # deleted \begin{equation}...\end{equation} — so consult and
+                # advance the old-document tracker instead.
+                in_old_sensitive = _in_sensitive_context_old()
+                _track_depth_old(line)
                 stripped = line.rstrip('\n')
                 eol = '\n' if line.endswith('\n') else ''
-                result.append(_safe_del_line(stripped, eol,
-                                             force_comment=sensitive_depth > 0))
+                result.append(_safe_del_line(
+                    stripped, eol,
+                    force_comment=_in_sensitive_context()
+                    or in_old_sensitive
+                    or _touches_sensitive_delim(line)))
 
         elif tag == 'replace':
             ob = old_lines[i1:i2]
@@ -1425,12 +1520,22 @@ def diff_text_block(old, new):
                         nl = nb[k].rstrip('\n')
                         eol = '\n' if nb[k].endswith('\n') else ''
                         _track_depth(nb[k])
-                        if sensitive_depth > 0 or _sens_begin.search(nb[k]) or _sens_end.search(nb[k]):
-                            # Inside (or entering/leaving) a sensitive env:
-                            # comment old, keep new as-is
+                        _track_depth_old(ob[k])
+                        if (_in_sensitive_context() or _touches_sensitive_delim(nb[k])
+                                or _in_sensitive_context_old()
+                                or _touches_sensitive_delim(ob[k])):
+                            # Inside (or entering/leaving) a sensitive env, on
+                            # either the old or the new side: comment old,
+                            # keep new as-is.  force_comment=True
+                            # unconditionally: this branch is only entered when
+                            # at least one of the conditions above holds, so
+                            # the old line must always be commented, never
+                            # \sout{}/{\color{}}-wrapped (e.g. a closing \]/$$/
+                            # \end{equation} line flips the tracked depth/toggle
+                            # back to "outside" by the time this is evaluated).
                             old_eol = '\n' if ob[k].endswith('\n') else ''
                             result.append(_safe_del_line(ol, old_eol,
-                                                         force_comment=sensitive_depth > 0))
+                                                         force_comment=True))
                             result.append(nb[k])
                         elif is_structural(ol) or is_structural(nl):
                             old_eol = '\n' if ob[k].endswith('\n') else ''
@@ -1458,12 +1563,19 @@ def diff_text_block(old, new):
                             result.append(diff_words_in_line(ol, nl) + eol)
                     elif k < len(ob):
                         line = ob[k]
+                        in_old_sensitive = _in_sensitive_context_old()
+                        _track_depth_old(line)
                         stripped = line.rstrip('\n')
                         eol = '\n' if line.endswith('\n') else ''
-                        result.append(_safe_del_line(stripped, eol))
+                        result.append(_safe_del_line(
+                            stripped, eol,
+                            force_comment=_in_sensitive_context()
+                            or in_old_sensitive
+                            or _touches_sensitive_delim(line)))
                     else:
+                        touches = _touches_sensitive_delim(nb[k])
                         _track_depth(nb[k])
-                        if sensitive_depth > 0:
+                        if _in_sensitive_context() or touches:
                             result.append(nb[k])
                         else:
                             result.append(_safe_add_line(

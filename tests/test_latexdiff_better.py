@@ -1158,9 +1158,16 @@ _INTEG_NEW_BODY = textwrap.dedent(r"""
 
 
 def _run(cmd, cwd):
-    """Run a subprocess; return (returncode, combined stdout+stderr)."""
+    """Run a subprocess; return (returncode, combined stdout+stderr).
+
+    Uses errors='replace' (not strict, the subprocess.run(text=True) default)
+    because some pdflatex logs embed non-UTF-8 bytes from font metadata
+    messages (e.g. Latin-1 glyph names in German hyphenation font .pfb
+    files), which otherwise raise UnicodeDecodeError before the test can
+    even inspect the log for "Fatal error".
+    """
     result = subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True
+        cmd, cwd=cwd, capture_output=True, encoding='utf-8', errors='replace'
     )
     return result.returncode, result.stdout + result.stderr
 
@@ -1473,3 +1480,228 @@ class TestIntegrationRl2oceanSrsOldMainRename:
         assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
         assert (dest / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"
 
+
+
+# ---------------------------------------------------------------------------
+# Bug 11 — raw '#' inside \textcolor{}{} breaks hyperref's \Hy@tempa patch
+# ---------------------------------------------------------------------------
+
+class TestBug11RawHashInTextcolor:
+    r"""Bug 11 (compilation error): \textcolor{ao}{\url{...#...}} (or \href
+    with a '#' fragment) produces "Illegal parameter number in definition of
+    \Hy@tempa" under hyperref, because hyperref patches \textcolor to
+    \edef-prescan its argument for colour tracking across hyperlinks, before
+    \url/\href get a chance to locally change '#''s catcode. The {\color{ao}
+    ...} group form is unaffected. Fixed by making add_markup() fall back to
+    the group form whenever the text contains a raw (unescaped) '#'.
+    """
+
+    def test_add_markup_uses_color_group_for_raw_hash(self):
+        r"""Text with an unescaped '#' uses {\color{ao}...}, not \textcolor{}{}."""
+        out = ldb.add_markup(r"\url{https://example.com/page#section}")
+        assert out == r'{\color{ao}\url{https://example.com/page#section}}'
+        assert r'\textcolor{ao}{' not in out
+
+    def test_add_markup_uses_textcolor_without_hash(self):
+        """Text without a '#' still uses the normal \\textcolor{ao}{} form."""
+        out = ldb.add_markup(r"\url{https://example.com/page}")
+        assert out == r'\textcolor{ao}{\url{https://example.com/page}}'
+
+    def test_add_markup_escaped_hash_is_not_raw(self):
+        r"""A backslash-escaped \# is not treated as a raw '#'."""
+        out = ldb.add_markup(r"Section \#1 details")
+        assert out == r'\textcolor{ao}{Section \#1 details}'
+
+    def test_full_pipeline_added_url_with_hash_fragment(self):
+        r"""End-to-end: an added \url{...#...} is wrapped with {\color{ao}...}."""
+        old = "See \\url{https://example.com/a}.\n"
+        new = "See \\url{https://example.com/a#fragment}.\n"
+        out = run_diff(old, new)
+        assert r'{\color{ao}' in out
+        assert r'\textcolor{ao}{\url{https://example.com/a#fragment}}' not in out
+
+
+# ---------------------------------------------------------------------------
+# Bug 12 — content inside a wholly-deleted math environment must be commented
+# ---------------------------------------------------------------------------
+
+class TestBug12DeletedMathEnvironmentContent:
+    r"""Bug 12 (compilation error): content lines inside a deleted
+    \begin{equation}...\end{equation} (or \[...\], or legacy $$...$$) block
+    rely on the surrounding delimiters for math mode. Once the whole block
+    is deleted, _COMMENT_DEL_RE already force-comments the \begin{}/\end{}
+    delimiter lines themselves, but the bare math content in between (e.g.
+    containing '_' or other math-only syntax) was previously \sout{}-wrapped
+    as plain text and broke compilation ("Missing $ inserted", cascading
+    errors). Fixed by tracking "sensitive" (math) environment depth across
+    the whole diff, including a dedicated OLD-document depth tracker so that
+    content lines in a pure 'delete' opcode (the block was removed outright,
+    not replaced) are also recognised as being inside the block and force-
+    commented, not just the delimiter lines.
+    """
+
+    def test_deleted_equation_block_content_is_commented(self):
+        r"""All lines of a wholly-deleted \begin{equation}...\end{equation}
+        block, including interior content, become % DIFF-DEL: comments."""
+        old = (
+            "Intro text.\n"
+            "\\begin{equation}\n"
+            "\\Delta = CDF_{sim}(x)-CDF_{m}(x)\n"
+            "\\end{equation}\n"
+            "Outro text.\n"
+        )
+        new = "Intro text.\nOutro text.\n"
+        out = ldb.diff_text_block(old, new)
+        assert r'% DIFF-DEL: \begin{equation}' in out
+        assert r'% DIFF-DEL: \Delta = CDF_{sim}(x)-CDF_{m}(x)' in out
+        assert r'% DIFF-DEL: \end{equation}' in out
+        assert r'\sout{\Delta' not in out, (
+            "Math content inside a deleted equation block must never be "
+            r"\sout{}-wrapped as plain text"
+        )
+
+    def test_deleted_display_math_brackets_content_is_commented(self):
+        r"""Content inside a wholly-deleted \[...\] block is also commented out."""
+        old = "Intro.\n\\[\nx_{i} = y_{i} + z\n\\]\nOutro.\n"
+        new = "Intro.\nOutro.\n"
+        out = ldb.diff_text_block(old, new)
+        assert r'% DIFF-DEL: x_{i} = y_{i} + z' in out
+
+    def test_deleted_dollar_dollar_block_content_is_commented(self):
+        r"""Content inside a wholly-deleted legacy $$...$$ block is commented
+        out, including correct handling of the closing $$ line itself (the
+        toggle flips to "inactive" on that exact line, before the fallback
+        pass-through check runs, requiring a dedicated per-line delimiter
+        check rather than relying on the post-update toggle state alone)."""
+        old = "Intro.\n$$\nr = a+b\n$$\nOutro.\n"
+        new = "Intro.\nOutro.\n"
+        out = ldb.diff_text_block(old, new)
+        assert r'% DIFF-DEL: $$' in out
+        assert r'% DIFF-DEL: r = a+b' in out
+
+    def test_replace_paired_deleted_equation_content_is_commented(self):
+        """The paired-replace branch (old equation block replaced by new
+        prose at the same positions) must also comment the old math lines,
+        not just the pure-delete case."""
+        old = (
+            "Intro.\n"
+            "\\begin{equation}\n"
+            "x = y_{1} + y_{2}\n"
+            "\\end{equation}\n"
+        )
+        new = "Changed intro.\nSome new prose here.\nMore new prose.\nFinal line.\n"
+        out = ldb.diff_text_block(old, new)
+        assert r'% DIFF-DEL: x = y_{1} + y_{2}' in out
+        assert r'\sout{x = y' not in out
+
+
+# ---------------------------------------------------------------------------
+# Bug 13 — \hhline{}/\cline{} not recognised as trailing row-end markers
+# ---------------------------------------------------------------------------
+
+class TestBug13HhlineClineRowSplitting:
+    r"""Bug 13 (compilation error): the row-splitting regex only recognised
+    \hline as a trailing rule command after a row's \\. \hhline{...} and
+    \cline{...} (both common in heavily-ruled tables) were left unconsumed
+    and glued onto the *next* row's first cell, corrupting it once that cell
+    was wrapped in \cellcolor{diffadd} ("Misplaced \omit"/"Leaders not
+    followed by proper glue" errors). Fixed by adding \hhline{...}/\cline{...}
+    recognition to the shared _ROW_END_PATTERN used by split_cells(),
+    count_cells(), row_trailing(), and _split_rows_brace_aware().
+    """
+
+    def test_split_cells_strips_trailing_hhline(self):
+        row = r"A & B \\ \hhline{==}"
+        assert ldb.split_cells(row) == ['A', 'B']
+
+    def test_split_cells_strips_trailing_cline(self):
+        row = r"A & B \\ \cline{1-2}"
+        assert ldb.split_cells(row) == ['A', 'B']
+
+    def test_row_trailing_captures_hhline(self):
+        row = r"A & B \\ \hhline{==}"
+        assert ldb.row_trailing(row) == r'\\ \hhline{==}'
+
+    def test_row_trailing_captures_cline(self):
+        row = r"A & B \\ \cline{1-2}"
+        assert ldb.row_trailing(row) == r'\\ \cline{1-2}'
+
+    def test_count_cells_unaffected_by_trailing_hhline(self):
+        """count_cells() returns the & separator count (callers add 1 for
+        the actual cell count), unaffected by the trailing \\hhline{}."""
+        row = r"A & B & C \\ \hhline{===}"
+        assert ldb.count_cells(row) == 2
+
+    def test_next_row_first_cell_not_corrupted_by_hhline(self):
+        r"""A table row's \hhline{} suffix must not become the next row's
+        leading content once rows are split via _split_rows_brace_aware()."""
+        body = (
+            r"\textbf{ROSE-L} \\ \hhline{=======}" + "\n"
+            r"Data1 & Data2 \\ \hline" + "\n"
+        )
+        _begin, rows, _end, _ = ldb.parse_table_rows(
+            r"\begin{tabular}{ll}" + "\n" + body + r"\end{tabular}"
+        )
+        assert len(rows) == 3  # row 1, row 2, trailing empty split remainder
+        assert not rows[1].lstrip().startswith(r'\hhline'), (
+            r"\hhline{} from row 1 must not leak into row 2's content"
+        )
+        assert ldb.split_cells(rows[1]) == ['Data1', 'Data2']
+
+
+# ---------------------------------------------------------------------------
+# Integration — esa-rl2ocean-CVA-TN (no main-file rename; hhline/cline/$$/
+# \begin{equation}/url-with-# heavy document; regression coverage for Bugs
+# 11, 12 and 13, all found while diffing this real document)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.path.isdir("/home/mortenwh/esa-rl2ocean-CVA-TN"),
+    reason="esa-rl2ocean-CVA-TN repo not present",
+)
+@pytest.mark.skipif(
+    shutil.which("pdflatex") is None or shutil.which("bibtex") is None,
+    reason="pdflatex or bibtex not available",
+)
+class TestIntegrationCvaTn:
+    """Repo-level integration test: esa-rl2ocean-CVA-TN v0.2 -> v1.0.
+
+    Unlike the three prior real-document integration tests, this repo has no
+    main-file rename between tags (main.tex at both v0.2 and v1.0), so
+    --old-main is not required. The document is the most table/CSV-heavy
+    tested so far (48 body table environments) and the first to exercise
+    \\hhline, \\cline, legacy $$...$$ math, \\begin{equation}, and URLs with
+    '#' fragments, which is what surfaced Bugs 11-13.
+    """
+
+    SCRIPT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "latexdiff_better.py",
+    )
+    REPO = "/home/mortenwh/esa-rl2ocean-CVA-TN"
+
+    def test_v0_2_to_v1_0_compiles(self, tmp_path):
+        """v0.2 -> v1.0 diff of main.tex must compile to PDF with no fatal errors."""
+        dest = tmp_path / "repo"
+        shutil.copytree(self.REPO, dest, symlinks=True)
+
+        rc, out = _run(
+            [sys.executable, self.SCRIPT, "--git", "v0.2", "v1.0", "main.tex", "diff.tex"],
+            cwd=dest,
+        )
+        assert rc == 0, f"Script failed:\n{out}"
+        assert (dest / "diff.tex").exists(), "diff.tex was not created"
+
+        for ext in ("aux", "bbl", "blg", "toc", "out"):
+            (dest / f"diff.{ext}").unlink(missing_ok=True)
+
+        rc, out = _run(["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest)
+        assert "Fatal error" not in out, f"pdflatex pass 1 fatal error:\n{out}"
+        _run(["bibtex", "diff"], cwd=dest)
+        for _ in range(2):
+            rc, out = _run(
+                ["pdflatex", "-interaction=nonstopmode", "diff.tex"], cwd=dest
+            )
+            assert "Fatal error" not in out, f"pdflatex fatal error:\n{out}"
+        assert (dest / "diff.pdf").exists(), f"diff.pdf not produced:\n{out}"

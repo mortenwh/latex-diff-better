@@ -129,3 +129,49 @@ ignore the concurrent files.
 - Updated `DOCUMENTATION.md`, `AI_REASONING.md`, `INVESTIGATION.md`.
 **Outcome:** Tool confirmed usable end-to-end on this third real document; two more
 real bugs found and fixed with regression coverage; no known open issues remain.
+
+## 2026-10-02 — Fourth sibling-repo investigation: esa-rl2ocean-CVA-TN (no main rename)
+**Prompt:** Continue AGENTS.md's stated goal: test `latexdiff_better.py --git` against
+the `v0.2`→`v1.0` tags of `esa-rl2ocean-CVA-TN`, the fourth sibling repo investigated.
+**Actions:**
+- Ran the tool against the real repo (scratch copy in `/tmp/cva-tn-compile`); no
+  main-file rename this time (`main.tex` at both tags). Most table-heavy document so
+  far (48 body tables); first to exercise `\hhline`, `\cline`, legacy `$$...$$`,
+  `\begin{equation}`, and URL `#` fragments heavily.
+- Found and fixed Bug 11: `\textcolor{ao}{\url{...#...}}` breaks hyperref's
+  `\textcolor` patch (raw `#`). Fixed via `add_markup()` falling back to
+  `{\color{ao}...}` when text contains a raw `#`.
+- Found and fixed Bug 12: content lines inside a wholly-deleted math environment
+  (`\begin{equation}`, `\[...\]`, `$$...$$`) were `\sout{}`-wrapped as plain text,
+  breaking compilation. Extended sensitive-environment depth tracking to cover math
+  environments/delimiters, including a dedicated *old-document* depth tracker for
+  purely-deleted blocks (no paired new line exists to drive the normal tracker) —
+  this second tracker was added after initial testing showed the first attempt
+  (output-depth tracker only) still failed for pure-delete opcodes with
+  balanced-brace math content.
+- Found and fixed Bug 13: `\hhline{}`/`\cline{}` not recognised as trailing row-end
+  markers (only `\hline` was), corrupting the next row's first cell (~474 pdflatex
+  errors). Fixed via a shared `_ROW_END_PATTERN` used by all 4 row-parsing call sites.
+- Iteratively regenerated the diff and recompiled after each fix: 476 → 2 (after Bug
+  13) → 0 fatal errors (after the final old-document depth-tracker fix for Bug 12).
+  Full end-to-end compile (`pdflatex` ×3 + `bibtex`) now produces a clean 117-page PDF;
+  remaining warnings (2 bibtex missing-citation, acronym hyperrefs,
+  `\texttwosuperior`) confirmed pre-existing in the source document itself.
+- Added regression tests: `TestBug11RawHashInTextcolor` (4), 
+  `TestBug12DeletedMathEnvironmentContent` (4), `TestBug13HhlineClineRowSplitting` (6),
+  `TestIntegrationCvaTn` (1 real-repo integration test). Also fixed a latent
+  `UnicodeDecodeError` in the shared test `_run()` helper (strict UTF-8 decode failed
+  on this document's pdflatex log) — needed for the new integration test to pass.
+  Full suite: 102 passed, 1 skipped (up from 87/1). No regressions.
+- Ran codespell/ruff/pylint/flake8/mypy/complexipy; no new issues introduced by this
+  session's changes (all flagged pre-existing findings fall outside the modified line
+  ranges, confirmed via `git diff --stat`/hunk inspection). Noted (not fixed):
+  `diff_text_block`'s complexipy score was already far above the 20-point threshold
+  before this session (153) and rose to 164 — a pre-existing, previously
+  undocumented violation; flagged in `INVESTIGATION.md` as an open question for the
+  user rather than silently refactored.
+- Updated `DOCUMENTATION.md`, `AI_REASONING.md`, `INVESTIGATION.md`.
+**Outcome:** Tool confirmed usable end-to-end on this fourth real document (and the
+first with heavy table-rule and math-environment usage); three more real bugs found
+and fixed with regression coverage. One pre-existing complexity concern
+(`diff_text_block`, score 164) flagged for the user to decide on a future refactor.

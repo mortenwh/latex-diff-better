@@ -287,3 +287,78 @@ pre-existing PDF/font warnings (duplicate PDF destination identifier, missing PK
 bitmaps regenerated on the fly) that are cosmetic TeX Live/PDF-metadata noise, not
 diff-tool correctness issues.
 
+## Investigation: v0.2 → v1.0 diff of esa-rl2ocean-CVA-TN
+
+Verified (2026-10-02) that `latexdiff_better.py --git` correctly diffs the `v0.2` →
+`v1.0` tags of the sibling `esa-rl2ocean-CVA-TN` repository. Unlike the three prior
+sibling-repo investigations, the main file is **not** renamed between tags (`main.tex`
+at both v0.2 and v1.0, so `--old-main` is not needed). This document is the most
+table-heavy tested so far (48 body table environments) and the first to exercise
+`\hhline`, `\cline`, legacy `$$...$$` display math, `\begin{equation}`, and URLs with
+`#` fragments — none of which were exercised this heavily by the three prior
+investigations, which is why the following three new bugs were only now discovered:
+
+1. **Bug 11 (compilation error) — raw `#` inside `\textcolor{}{}` breaks hyperref**:
+   `\textcolor{ao}{\url{...#...}}` (or `\href{...#...}{...}`) with `\usepackage{hyperref}`
+   loaded produces `! Illegal parameter number in definition of \Hy@tempa`. hyperref
+   patches `\textcolor` to `\edef`-prescan its argument for colour tracking across
+   hyperlinks, before `\url`/`\href` get a chance to locally change `#`'s catcode from
+   parameter (6) to other (12). The `{\color{...}...}` *group* form (used elsewhere in
+   this codebase, e.g. by `del_markup()`) is unaffected — confirmed via an isolated
+   minimal reproduction. Fixed by making `add_markup()` fall back to `{\color{ao}...}`
+   instead of `\textcolor{ao}{...}` whenever the text contains a raw (unescaped) `#`.
+   Regression tests: `TestBug11RawHashInTextcolor`.
+2. **Bug 12 (compilation error) — content inside a deleted math environment escapes
+   math mode**: content lines inside a wholly-deleted `\begin{equation}...\end{equation}`
+   (or `\[...\]`, or legacy `$$...$$`) block rely on the surrounding delimiters for math
+   mode. `_COMMENT_DEL_RE` already force-commented the delimiter lines themselves
+   (unconditionally, regardless of environment name), but the bare math content in
+   between (e.g. containing `_`, unescaped braces used as grouping, etc.) was still
+   `\sout{}`-wrapped as plain text once the delimiters were commented out, producing
+   cascading `! Missing $ inserted` errors. Fixed by extending the existing
+   "sensitive environment" depth-tracking mechanism (previously used for
+   `tikzpicture`/`algorithmic`/verbatim-like environments) to also track math
+   environments and `\[`/`\]`/`$$` delimiters, with a dedicated **old-document** depth
+   tracker (`old_sensitive_depth`/`_track_depth_old()`/`_in_sensitive_context_old()`)
+   so that interior content lines of a *wholly deleted* block (a pure `delete`
+   SequenceMatcher opcode, where no paired "new" line exists to drive the normal
+   output-depth tracker) are also correctly recognised as being inside the block and
+   force-commented. A related ordering subtlety: the `$$` toggle flips to "inactive"
+   exactly on its own closing line, before the usual post-update context check runs,
+   so a line-local `_touches_sensitive_delim()` check (independent of the toggle's
+   post-update state) is applied everywhere alongside the context check. Regression
+   tests: `TestBug12DeletedMathEnvironmentContent`.
+3. **Bug 13 (compilation error) — `\hhline{}`/`\cline{}` row-splitting corruption**:
+   the row-splitting regex (shared by `split_cells()`, `count_cells()`,
+   `row_trailing()`, and `_split_rows_brace_aware()`) only recognised `\hline` as a
+   trailing rule command after a row's `\\`. This document uses `\hhline{...}` (78
+   occurrences) and `\cline{...}` (90 occurrences) extensively as trailing rule
+   commands too (e.g. `...\\ \hhline{=======}`), which were left unconsumed and
+   glued onto the *next* row's first cell — corrupting it once wrapped in
+   `\cellcolor{diffadd}` and causing ~474 "Misplaced \omit"/"Leaders not followed by
+   proper glue" errors (one per affected row boundary across the 48 tables). Fixed
+   by adding `\hhline{...}`/`\cline{...}` recognition to a single shared
+   `_ROW_END_PATTERN` string, reused by all four previously-duplicated call sites
+   (also future-proofed `is_structural_row()`/`_STRUCT_PREFIX_RE` to recognise
+   `\hhline{}`/`\cline{}` as structural, even though they only appeared as trailing
+   markers — not leading — in this document). Regression tests:
+   `TestBug13HhlineClineRowSplitting`.
+
+Example invocation used to reproduce/verify:
+
+```bash
+python3 latexdiff_better.py --git /home/mortenwh/esa-rl2ocean-CVA-TN \
+    v0.2 v1.0 main.tex /tmp/cva_tn_diff.tex
+```
+
+Compiled cleanly (`pdflatex` ×3, `bibtex`) to a 117-page PDF with zero fatal errors.
+The only bibtex warnings (`\cite{TN1CANVAS2026}`/`\cite{TN4CANVAS2026}` having no
+matching `bibliography.bib` entry) are pre-existing in the source document itself
+(confirmed: these citation keys appear in `main.tex` with no corresponding entries in
+`bibliography.bib` at either tag) — not something introduced or caused by the diff
+tool. Remaining `pdflatex` warnings (undefined acronym hyperrefs on page 2,
+`\texttwosuperior` invalid in math mode) are also pre-existing in the original
+document's own compile log (confirmed by compiling `main.tex` directly at `v1.0`:
+102 and 4 occurrences respectively, matching the diff's warning counts), not
+diff-tool correctness issues.
+

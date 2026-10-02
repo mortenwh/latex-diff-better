@@ -216,3 +216,96 @@ incompatibility.
   command not yet in `_COMMENT_DEL_RE` (Bug 10's class of issue), add it there
   following the same pattern.
 
+## Question
+
+Following up on AGENTS.md's stated goal: can `latexdiff_better.py` (`--git` mode)
+correctly diff the `v0.2` → `v1.0` tags of the sibling repository
+`/home/mortenwh/esa-rl2ocean-CVA-TN`?
+
+## Method
+
+Same method as the three earlier investigations: inspect the sibling repo's file
+structure at both tags (checking in particular for a main-file rename, as seen in all
+three prior sibling repos), run `latexdiff_better.py --git` (writing output to a
+scratch copy of the repo at `/tmp/cva-tn-compile`, checked out at the newer tag, so
+the diff.tex lands alongside the bib/figures it needs), then compile with
+`pdflatex` ×3 + `bibtex`, tracking the `!` fatal-error count after each fix. Each of
+the three bugs found was additionally reproduced and confirmed in isolation (a
+minimal standalone `.tex` snippet outside the diff pipeline) before being fixed, to
+separate "pre-existing LaTeX/package incompatibility" from "diff-tool-introduced
+bug", following the established pattern from the three prior investigations.
+
+## Conclusions so far
+
+- **No main-file rename this time**: `main.tex` is the main file at both `v0.2` and
+  `v1.0` — unlike all three prior sibling-repo investigations. `--old-main` is not
+  needed for this document pair.
+- **Most table-heavy document tested so far**: 48 body table environments (vs. 44 for
+  esa-rl2ocean-srs), and the first to exercise `\hhline`, `\cline`, legacy
+  `$$...$$` display math, `\begin{equation}`, and URLs with `#` fragments this
+  heavily. This surfaced three new, previously latent bugs — all now fixed (see
+  `DOCUMENTATION.md` for full detail):
+  - **Bug 11 (fatal compile error)**: `\textcolor{ao}{\url{...#...}}` (hyperref +
+    raw `#` + the `\textcolor{}{}` macro form) produces "Illegal parameter number in
+    definition of `\Hy@tempa`". Fixed by making `add_markup()` fall back to the
+    `{\color{ao}...}` group form (unaffected by the bug) when the text contains a
+    raw `#`.
+  - **Bug 12 (fatal compile error)**: content lines inside a wholly-deleted math
+    environment (`\begin{equation}`, `\[...\]`, legacy `$$...$$`) were
+    `\sout{}`-wrapped as plain text once the enclosing delimiters were commented out,
+    producing cascading "Missing $ inserted" errors. Fixed by extending the existing
+    sensitive-environment depth-tracking mechanism to cover math environments/
+    delimiters, with a dedicated *old-document* depth tracker so interior content
+    lines of a purely-deleted block (no paired "new" line to drive the normal
+    output-depth tracker) are also recognised as sensitive and force-commented.
+  - **Bug 13 (fatal compile error)**: the shared row-splitting regex only recognised
+    `\hline` as a trailing rule command after a row's `\\`; this document's pervasive
+    `\hhline{...}`/`\cline{...}` trailing commands (78/90 occurrences) were left
+    unconsumed and corrupted the next row's first cell once colour-wrapped (~474
+    "Misplaced \omit" errors). Fixed by extending the shared `_ROW_END_PATTERN` used
+    by all four row-parsing call sites.
+- End-to-end verification: `python3 latexdiff_better.py --git
+  /home/mortenwh/esa-rl2ocean-CVA-TN v0.2 v1.0 main.tex output.tex` now produces a
+  `diff.tex` that compiles cleanly (`pdflatex` ×3, `bibtex`) to a 117-page PDF with
+  **zero fatal errors** (down from 476 before any fixes). Remaining bibtex warnings
+  (2 undefined citation keys) and pdflatex warnings (undefined acronym hyperrefs,
+  `\texttwosuperior` in math mode) are all confirmed pre-existing in the source
+  document itself (verified by compiling `main.tex` directly), not diff-tool issues.
+- Regression tests added: `TestBug11RawHashInTextcolor` (4 tests),
+  `TestBug12DeletedMathEnvironmentContent` (4 tests),
+  `TestBug13HhlineClineRowSplitting` (6 tests), `TestIntegrationCvaTn` (1 real-repo
+  integration test). Also fixed a latent `UnicodeDecodeError` in the test suite's
+  shared `_run()` subprocess helper (strict UTF-8 decoding failed on this document's
+  pdflatex log, which embeds non-UTF-8 font-metadata bytes) — needed for the new
+  integration test to run at all. Full suite: 102 passed, 1 skipped (up from 87/1).
+- `diff_text_block`'s complexipy cognitive-complexity score was already far above the
+  project's 20-point threshold before this session (153) and rose further to 164
+  (+11 total across both rounds of fixes this session). This is a pre-existing,
+  long-standing violation (not introduced by this session) that was not previously
+  flagged/documented in `AI_REASONING.md`; a full refactor is out of scope for this
+  surgical bug-fix session (would touch a very large, already-complex function) and
+  should be discussed with the user as a dedicated future task.
+
+## Key remaining questions
+
+- `diff_text_block`'s cognitive complexity (164, pre-existing baseline 153) has not
+  been discussed with the user or documented as an accepted/deferred violation
+  anywhere before this session. Should it be refactored (e.g. extracting the
+  per-opcode branches into named helper functions) in a dedicated future session?
+- Is there a real document (not yet seen) where a *section-rename* pairing (the
+  `section_rename` branch of `diff_text_block()`) immediately abuts a math/sensitive
+  environment? That branch's `ob[1:]`/`nb[1:]` remainder loops still do not consult
+  the sensitive-context trackers at all (a pre-existing gap, not touched this
+  session since it wasn't observed to be hit by any real document so far).
+
+## Concrete next steps
+
+- No further code changes planned for the CVA-TN investigation itself; it is
+  considered resolved — the tool now diffs this document cleanly end-to-end.
+- Discuss with the user whether `diff_text_block`'s complexity should be addressed
+  in a dedicated refactor session (extracting opcode-branch helpers), given it is
+  now the single highest-complexity function in the codebase by a wide margin.
+- If a future document is found to combine a section rename with an adjacent
+  sensitive/math environment, revisit the `section_rename` branch's `ob[1:]`/`nb[1:]`
+  remainder loops to apply the same sensitive-context handling as the other
+  branches.
